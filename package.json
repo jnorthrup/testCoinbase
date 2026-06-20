@@ -1,0 +1,21 @@
+{
+  "name": "testcoinbase",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && node portfolio.js --help >/dev/null && node agent-trader.js --help >/dev/null",
+    "portfolio": "node portfolio.js",
+    "agent:preview-sell-btc": "node agent-trader.js preview-sell BTC 10"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@coinbase/cdp-sdk": "^1.51.2",
+    "@coinbase/coinbase-sdk": "^0.25.0",
+    "dotenv": "^17.4.2",
+    "jose": "^6.2.3",
+    "jsonwebtoken": "^9.0.3"
+  }
+}

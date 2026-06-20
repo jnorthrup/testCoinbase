@@ -1,0 +1,43 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# build output
+.dist/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# runtime/local state
+runs/
+logs/
+*.log
+.DS_Store
+
+# environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p8
+*.p12
+*.crt
+*.csr
+*.jks
+*.keystore
+*api_key*.json
+*apikey*.json
+*credential*.json
+*credentials*.json
+*secret*.json
+.cdp/
+
+# local Coinbase experiments that can print credential details
+coinbase-client.js
+trade-client.js
+
+# separate scaffold/nested git repo; keep out of this trading-client repo
+cdp-app-react/
