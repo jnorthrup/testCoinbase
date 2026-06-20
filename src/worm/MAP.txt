@@ -1,0 +1,33 @@
+Robinhood worm map
+
+Original file: robinhood-worm.js
+
+Extracted modules:
+- 18-51   AssetRegimeManager -> src/worm/regime.mjs
+- 52-88   RegimeDetector -> src/worm/regime.mjs
+- 89-261  LegionManager -> src/worm/legion/legion-manager.mjs
+- 1902-1949 trading helpers -> src/worm/utils/trading-helpers.mjs
+- 2167-2353 CoinbaseWormAPI compatibility surface -> src/worm/api/coinbase-adapter.mjs
+- 481-1852 TradingEngine -> src/worm/engine/trading-engine.mjs
+- Coinbase adapter shim -> src/worm/api/coinbase-adapter.mjs
+- 3333-3367 SweepStateManager -> src/worm/optimizer/sweep-state-manager.mjs
+- 3368-3414 TradeHistoryAnalyzer -> src/worm/optimizer/trade-history-analyzer.mjs
+- config constants -> src/worm/config/trading-config.mjs
+- legion config -> src/worm/config/legion-config.mjs
+
+Still embedded in robinhood-worm.js:
+- 451-482 autoConfigMinQuantities call site/bootstrap usage
+- 1866-1901 printTable
+- 1962-2166 market/state persistence helpers
+- 3415-4300 ScientificOptimizer
+- 2356-3332 mainLoop/runtime wiring
+
+Coinbase compatibility evidence:
+- trade.js account listing succeeds against Coinbase using local credentials
+- coinbase-adapter.mjs exposes the worm-facing methods: getBalance/getHoldings/getQuotes/placeBuy/placeSell/getOrderStatus
+- no direct Robinhood HTTP client remains in src/worm/api
+
+Next cut:
+- extract persistence helpers
+- extract TradingEngine constructor + order helpers
+- remove remaining Robinhood compatibility naming from runtime/bootstrap

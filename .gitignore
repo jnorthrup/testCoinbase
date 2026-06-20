@@ -14,6 +14,10 @@ runs/
 logs/
 *.log
 .DS_Store
+liveEngineState.json
+market_data.jsonl
+dreamer_brain_scan.json
+configs/asset_regime_memory.json
 
 # environment and credentials
 .env

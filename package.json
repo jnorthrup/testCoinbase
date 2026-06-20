@@ -4,11 +4,16 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && node portfolio.js --help >/dev/null && node agent-trader.js --help >/dev/null",
+    "test": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && npm run worm:check && node portfolio.js --help >/dev/null && node agent-trader.js --help >/dev/null",
     "portfolio": "node portfolio.js",
     "agent:preview-sell-btc": "node agent-trader.js preview-sell BTC 10",
     "regime": "node regime.js",
-    "regime:all": "node regime.js --all"
+    "regime:all": "node regime.js --all",
+    "worm:check": "node --check robinhood-worm.js && node --check src/worm/index.mjs && node --check src/worm/api/coinbase-adapter.mjs && node --check src/worm/engine/trading-engine.mjs",
+    "worm:dry-run-once": "node robinhood-worm.js --dry-run-once",
+    "worm:preview-sell-btc": "node robinhood-worm.js --preview-sell BTC 10",
+    "worm:preview-strategy": "node robinhood-worm.js --preview-strategy 10",
+    "worm": "node robinhood-worm.js"
   },
   "keywords": [],
   "author": "",

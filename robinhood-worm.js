@@ -1,9 +1,6 @@
 // Cryptobot Token Flex (ESM style) - v4.0.0 "Hyper-Evolutionary" - All Parameters Evolvable
 
-import axios from "axios";
-import nacl from "tweetnacl";
 import dotenv from "dotenv";
-import { Buffer } from "buffer";
 import crypto from "crypto"; // for crypto.randomUUID()
 import readline from "readline";
 import fs from 'fs';
@@ -11,6 +8,7 @@ import path from "path";
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import os from 'os';
+import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
 
 dotenv.config();
 
@@ -651,6 +649,9 @@ class TradingEngine {
     if (this.mode === 'LIVE' && api) {
       try {
         const resp = await api.placeSell(symbol, quantity);
+        if (resp?.preview_only) {
+          return resp;
+        }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
           return verified || resp;
@@ -691,6 +692,9 @@ class TradingEngine {
     if (this.mode === 'LIVE' && api) {
       try {
         const resp = await api.placeBuy(symbol, quantity);
+        if (resp?.preview_only) {
+          return resp;
+        }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
           return verified || resp;
@@ -1000,7 +1004,9 @@ class TradingEngine {
                 const sellResp = await this._placeSell(api, `${row.Symbol}-USD`, qtyStr, row.Price);
                 if (sellResp?.id) {
                   const effectiveSellPrice = getEffectivePriceFromResp(sellResp, row.Price) || row.Price;
-                  const actualSoldValue = parseFloat(qtyStr) * effectiveSellPrice;
+                  const settledSoldValue = getSettledValueFromResp(sellResp, qtyStr, row.Price);
+                  const grossSoldValue = getGrossValueFromResp(sellResp, qtyStr, row.Price);
+                  const totalFees = getTotalFeesFromResp(sellResp);
 
                   // Measure and update lastSlippage
                   const slippage = (row.Price - effectiveSellPrice) / row.Price;
@@ -1008,11 +1014,11 @@ class TradingEngine {
                   rStObj.lastSlippage = Math.min(0.04, Math.max(0, slippage));
                   this.ratchetState[row.Symbol] = rStObj;
 
-                  this._logTrade({ asset: row.Symbol, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `Portfolio Baseline Reset Harvest` });
+                  this._logTrade({ asset: row.Symbol, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `Portfolio Baseline Reset Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
                   if (row.Value < dynamicCriticalMass) {
-                    snowballHarvestedAmount += actualSoldValue;
+                    snowballHarvestedAmount += settledSoldValue;
                   } else {
-                    matureHarvestedAmount += actualSoldValue;
+                    matureHarvestedAmount += settledSoldValue;
                   }
                   tokenBaselines[row.Symbol] = originalBaseline;
                   if (trailingState[row.Symbol]) delete trailingState[row.Symbol];
@@ -1020,7 +1026,7 @@ class TradingEngine {
 
                   // Update Cash (Live & Shadow)
                   if (this.mode === 'LIVE') {
-                    this.cashBalance += actualSoldValue;
+                    this.cashBalance += settledSoldValue;
                   }
                   // SHADOW MODE: Update Holdings & Cash (with 1% fee)
                   else if (this.mode === 'SHADOW') {
@@ -1029,10 +1035,10 @@ class TradingEngine {
                       this.holdings[row.Symbol].rawQuantity -= soldQty;
                       if (this.holdings[row.Symbol].rawQuantity < 0) this.holdings[row.Symbol].rawQuantity = 0;
                     }
-                    this.cashBalance += (actualSoldValue * 0.99); // 1% fee
+                    this.cashBalance += settledSoldValue;
                   }
 
-                  return actualSoldValue;
+                  return settledSoldValue;
                 }
                 return 0;
               } catch (err) { console.error(`   ❌ Error P-Harvest sell ${row.Symbol}:`, err.message); return 0; }
@@ -1174,7 +1180,9 @@ class TradingEngine {
                   const sellResp = await this._placeSell(api, `${sym}-USD`, qtyStr, curP);
                   if (sellResp?.id) {
                     const effectiveSellPrice = getEffectivePriceFromResp(sellResp, curP) || curP;
-                    const actualSoldValue = parseFloat(qtyStr) * effectiveSellPrice;
+                    const settledSoldValue = getSettledValueFromResp(sellResp, qtyStr, curP);
+                    const grossSoldValue = getGrossValueFromResp(sellResp, qtyStr, curP);
+                    const totalFees = getTotalFeesFromResp(sellResp);
 
                     // Measure and update lastSlippage
                     const slippage = (curP - effectiveSellPrice) / curP;
@@ -1182,13 +1190,13 @@ class TradingEngine {
                       this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                     }
                     this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                    this._logTrade({ asset: sym, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `${harvestType} Harvest` });
+                    this._logTrade({ asset: sym, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `${harvestType} Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
                     if (totalVal < dynamicCriticalMass) {
-                      snowballHarvestedAmount += actualSoldValue;
+                      snowballHarvestedAmount += settledSoldValue;
                     } else {
-                      matureHarvestedAmount += actualSoldValue;
+                      matureHarvestedAmount += settledSoldValue;
                     }
-                    harvestedAmount += actualSoldValue; anyTradesThisCycle = true;
+                    harvestedAmount += settledSoldValue; anyTradesThisCycle = true;
 
                     // Tier 1: Post-Mortem Event
                     if (this.mode === 'LIVE') {
@@ -1239,7 +1247,7 @@ class TradingEngine {
                     lastActionTimestamps[sym] = now;
 
                     if (this.mode === 'LIVE') {
-                      this.cashBalance += actualSoldValue;
+                      this.cashBalance += settledSoldValue;
                     }
                     else if (this.mode === 'SHADOW') {
                       // Tier 2: Real Transaction Costs (1% Slippage/Fee Model)
@@ -1249,7 +1257,7 @@ class TradingEngine {
                         if (this.holdings[sym].rawQuantity < 0) this.holdings[sym].rawQuantity = 0;
                       }
                       // Sell: Proceeds = Value - 1%
-                      this.cashBalance += (actualSoldValue * 0.99);
+                      this.cashBalance += settledSoldValue;
                     }
 
                     delete trailingState[sym]; stateChanged = true;
@@ -1941,10 +1949,15 @@ function checkMinQuantity(symbol, qty) {
   return true;
 }
 
-function logTrade({ asset, side, quantity, price, clientOrderId, note = "" }) {
+function logTrade({ asset, side, quantity, price, clientOrderId, note = "", grossValue = null, totalFees = null, settledValue = null }) {
   try {
-    const quantityNum = parseFloat(quantity); const priceNum = parseFloat(price); if (isNaN(quantityNum) || isNaN(priceNum) || priceNum <= 0) { console.error(`Error logging trade: Invalid numeric values. Qty: ${quantity}, Price: ${price}`); return; } const totalValue = (quantityNum * priceNum).toFixed(2); appendTradeHistory({ asset, side: side.toUpperCase(), orderType: "market", quantity, effectivePrice: price, totalValue, clientOrderId, extra: { note } });
+    const quantityNum = parseFloat(quantity); const priceNum = parseFloat(price); if (isNaN(quantityNum) || isNaN(priceNum) || priceNum <= 0) { console.error(`Error logging trade: Invalid numeric values. Qty: ${quantity}, Price: ${price}`); return; } const totalValue = (quantityNum * priceNum).toFixed(2); const grossValueNum = parseOptionalNumber(grossValue) ?? (quantityNum * priceNum); const totalFeesNum = parseOptionalNumber(totalFees) ?? 0; const settledValueNum = parseOptionalNumber(settledValue) ?? Math.max(0, grossValueNum - totalFeesNum); appendTradeHistory({ asset, side: side.toUpperCase(), orderType: "market", quantity, effectivePrice: price, totalValue, grossValue: grossValueNum.toFixed(8), totalFees: totalFeesNum.toFixed(8), settledValue: settledValueNum.toFixed(8), clientOrderId, extra: { note } });
   } catch (error) { console.error(`Error logging trade for ${asset}:`, error); }
+}
+
+function parseOptionalNumber(value) {
+  const num = parseFloat(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 function appendTradeHistory(tradeRecord) {
@@ -2073,6 +2086,466 @@ function getEffectivePriceFromResp(resp, fallbackPrice) {
   const priceStr = resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price || fallbackPrice?.toString(); if (priceStr === undefined || priceStr === null) return null; const priceNum = parseFloat(priceStr); return !isNaN(priceNum) && priceNum > 0 ? priceNum : null;
 }
 
+function getFilledQuantityFromResp(resp, fallbackQuantity = null) {
+  const filledQty = parseOptionalNumber(resp?.filled_asset_quantity ?? resp?.filled_quantity);
+  if (filledQty !== null && filledQty > 0) return filledQty;
+  const fallbackQty = parseOptionalNumber(fallbackQuantity);
+  return fallbackQty !== null && fallbackQty > 0 ? fallbackQty : 0;
+}
+
+function getTotalFeesFromResp(resp) {
+  const fees = parseOptionalNumber(resp?.total_fees ?? resp?.fees ?? resp?.raw?.order?.total_fees ?? resp?.raw?.total_fees);
+  return fees !== null && fees >= 0 ? fees : 0;
+}
+
+function getGrossValueFromResp(resp, fallbackQuantity = null, fallbackPrice = null) {
+  const filledValue = parseOptionalNumber(resp?.filled_value ?? resp?.quote_value ?? resp?.raw?.order?.filled_value ?? resp?.raw?.filled_value);
+  if (filledValue !== null && filledValue >= 0) return filledValue;
+  const qty = getFilledQuantityFromResp(resp, fallbackQuantity);
+  const price = getEffectivePriceFromResp(resp, fallbackPrice);
+  return qty > 0 && price !== null && price > 0 ? qty * price : 0;
+}
+
+function getSettledValueFromResp(resp, fallbackQuantity = null, fallbackPrice = null) {
+  const netValue = parseOptionalNumber(resp?.total_value_after_fees ?? resp?.net_value ?? resp?.raw?.order?.total_value_after_fees ?? resp?.raw?.total_value_after_fees);
+  if (netValue !== null && netValue >= 0) return netValue;
+  const grossValue = getGrossValueFromResp(resp, fallbackQuantity, fallbackPrice);
+  const fees = getTotalFeesFromResp(resp);
+  return grossValue > 0 ? Math.max(0, grossValue - fees) : 0;
+}
+
+function parsePreviewOrderArgs(argv = process.argv) {
+  const sellIdx = argv.indexOf('--preview-sell');
+  const buyIdx = argv.indexOf('--preview-buy');
+  const idx = sellIdx !== -1 ? sellIdx : buyIdx;
+  if (idx === -1) return null;
+  const side = sellIdx !== -1 ? 'SELL' : 'BUY';
+  const symbol = String(argv[idx + 1] || '').trim().toUpperCase();
+  const usdAmount = Number(argv[idx + 2]);
+  if (!symbol || !Number.isFinite(usdAmount) || usdAmount <= 0) {
+    throw new Error(`Usage: node robinhood-worm.js ${side === 'SELL' ? '--preview-sell' : '--preview-buy'} BTC 10`);
+  }
+  return { side, symbol, usdAmount, productId: `${symbol}-USD` };
+}
+
+function parseStrategyPreviewArgs(argv = process.argv) {
+  const idx = argv.indexOf('--preview-strategy');
+  if (idx === -1) return null;
+  const maybeAmount = argv[idx + 1];
+  const requestedUsd = (maybeAmount === undefined || String(maybeAmount).startsWith('--')) ? 10 : Number(maybeAmount);
+  if (!Number.isFinite(requestedUsd) || requestedUsd <= 0) {
+    throw new Error('Usage: node robinhood-worm.js --preview-strategy [usdAmount]');
+  }
+  return { requestedUsd };
+}
+
+function parseStrategyPlaceArgs(argv = process.argv) {
+  const idx = argv.indexOf('--place-strategy');
+  if (idx === -1) return null;
+  const maybeAmount = argv[idx + 1];
+  const requestedUsd = (maybeAmount === undefined || String(maybeAmount).startsWith('--')) ? 10 : Number(maybeAmount);
+  if (!Number.isFinite(requestedUsd) || requestedUsd <= 0) {
+    throw new Error('Usage: ALLOW_LIVE_TRADE=1 node robinhood-worm.js --place-strategy [usdAmount] --yes');
+  }
+  return { requestedUsd, confirm: argv.includes('--yes') };
+}
+
+
+
+function getLiveTriggerEnvelope(engine, symbol, api) {
+  const ratchet = engine?.ratchetState?.[symbol] || null;
+  const hMod = ratchet ? (ratchet.harvestModifier || 0.0) : 0.0;
+  const rMod = ratchet ? (ratchet.rebalanceModifier || 0.0) : 0.0;
+
+  const slipConfig = SLIPPAGE_BUFFERS[symbol] || SLIPPAGE_BUFFERS.DEFAULT;
+  const lastBuySlip = ratchet && ratchet.lastSlippage !== undefined && ratchet.lastSlippage !== null ? ratchet.lastSlippage : slipConfig.buy;
+  const lastSellSlip = ratchet && ratchet.lastSlippage !== undefined && ratchet.lastSlippage !== null ? ratchet.lastSlippage : slipConfig.sell;
+  const apiBuySlip = api?.lastSpreads?.[symbol]?.buy;
+  const apiSellSlip = api?.lastSpreads?.[symbol]?.sell;
+  const effectiveBuySlip = apiBuySlip !== undefined ? Math.max(apiBuySlip, lastBuySlip) : lastBuySlip;
+  const effectiveSellSlip = apiSellSlip !== undefined ? Math.max(apiSellSlip, lastSellSlip) : lastSellSlip;
+
+  let rebalanceTrigger = (getGenomicParam(engine.genome, 'FLAT_REBALANCE_TRIGGER_PERCENT', symbol) || 0) + rMod;
+  if (engine.isGlobalRiskSignalActive) {
+    rebalanceTrigger *= (engine.genome.CRASH_PROTECTION_THRESHOLD_INCREASE || 2);
+  }
+  rebalanceTrigger += effectiveBuySlip;
+
+  return {
+    harvestTrigger: (getGenomicParam(engine.genome, 'FLAT_HARVEST_TRIGGER_PERCENT', symbol) || 0) + hMod + effectiveSellSlip,
+    rebalanceTrigger,
+  };
+}
+
+function selectStrategyPreviewCandidate(engine, portfolioSummary, holdingDetails, cashBalance, api, requestedUsd = 10) {
+  const harvestCandidates = [];
+  const rebalanceCandidates = [];
+
+  for (const row of portfolioSummary) {
+    const sym = row.Symbol;
+    const baseline = row.Baseline;
+    const price = row.Price;
+    const value = row.Value;
+    if (!sym || !Number.isFinite(price) || price <= 0 || !Number.isFinite(baseline) || baseline <= 0 || !Number.isFinite(value) || value <= 0) continue;
+
+    const deviationRatio = (value - baseline) / baseline;
+    const availableQty = holdingDetails[sym]?.rawQuantity || 0;
+    const { harvestTrigger, rebalanceTrigger } = getLiveTriggerEnvelope(engine, sym, api);
+
+    if (!HARVEST_EXCLUDE.includes(sym) && availableQty > 0 && deviationRatio >= harvestTrigger) {
+      const usdAmount = Math.min(requestedUsd, value);
+      const quantity = roundQty(sym, usdAmount / price);
+      const tradeValue = parseFloat(quantity) * price;
+      if (parseFloat(quantity) > 0 && availableQty >= parseFloat(quantity) && checkMinQuantity(sym, quantity) && checkMinTrade(tradeValue)) {
+        harvestCandidates.push({
+          side: 'SELL',
+          symbol: sym,
+          productId: `${sym}-USD`,
+          usdAmount,
+          previewPrice: price,
+          previewQuantity: quantity,
+          selectionMode: 'exact-harvest-trigger',
+          reason: 'live harvest trigger active',
+          exactTrigger: true,
+          deviationRatio,
+          activeHarvestTrigger: harvestTrigger,
+          activeRebalanceTrigger: rebalanceTrigger,
+          triggerGap: deviationRatio - harvestTrigger,
+          availableQuantity: availableQty,
+        });
+      }
+    }
+
+    if (!REBALANCE_EXCLUDE.includes(sym) && deviationRatio <= -rebalanceTrigger) {
+      const usdAmount = Math.min(requestedUsd, cashBalance);
+      const quantity = roundQty(sym, usdAmount / price);
+      const tradeValue = parseFloat(quantity) * price;
+      if (usdAmount > 0 && parseFloat(quantity) > 0 && checkMinQuantity(sym, quantity) && checkMinTrade(tradeValue) && cashBalance >= tradeValue) {
+        rebalanceCandidates.push({
+          side: 'BUY',
+          symbol: sym,
+          productId: `${sym}-USD`,
+          usdAmount,
+          previewPrice: price,
+          previewQuantity: quantity,
+          selectionMode: 'exact-rebalance-trigger',
+          reason: 'live rebalance trigger active',
+          exactTrigger: true,
+          deviationRatio,
+          activeHarvestTrigger: harvestTrigger,
+          activeRebalanceTrigger: rebalanceTrigger,
+          triggerGap: Math.abs(deviationRatio) - rebalanceTrigger,
+          availableQuantity: availableQty,
+        });
+      }
+    }
+  }
+
+  harvestCandidates.sort((a, b) => (b.triggerGap - a.triggerGap) || (b.usdAmount - a.usdAmount));
+  if (harvestCandidates.length > 0) return harvestCandidates[0];
+
+  rebalanceCandidates.sort((a, b) => (b.triggerGap - a.triggerGap) || (b.usdAmount - a.usdAmount));
+  if (rebalanceCandidates.length > 0) return rebalanceCandidates[0];
+
+  const fallbackCandidates = portfolioSummary
+    .filter((row) => {
+      const availableQty = holdingDetails[row.Symbol]?.rawQuantity || 0;
+      return row.Symbol && row.Price > 0 && availableQty > 0 && row.Value >= Math.min(requestedUsd, row.Value) && row.Symbol !== 'USDC' && row.Symbol !== 'USDG';
+    })
+    .map((row) => ({
+      side: 'SELL',
+      symbol: row.Symbol,
+      productId: `${row.Symbol}-USD`,
+      usdAmount: Math.min(requestedUsd, row.Value),
+      previewPrice: row.Price,
+      previewQuantity: roundQty(row.Symbol, Math.min(requestedUsd, row.Value) / row.Price),
+      selectionMode: 'fallback-dominant-holding',
+      reason: 'no exact live strategy trigger active; previewing dominant live holding instead',
+      exactTrigger: false,
+      deviationRatio: Number.isFinite(row.Baseline) && row.Baseline > 0 ? ((row.Value - row.Baseline) / row.Baseline) : null,
+      activeHarvestTrigger: null,
+      activeRebalanceTrigger: null,
+      triggerGap: null,
+      availableQuantity: holdingDetails[row.Symbol]?.rawQuantity || 0,
+      holdingValue: row.Value,
+    }))
+    .filter((candidate) => parseFloat(candidate.previewQuantity) > 0 && checkMinQuantity(candidate.symbol, candidate.previewQuantity) && checkMinTrade(parseFloat(candidate.previewQuantity) * candidate.previewPrice) && candidate.availableQuantity >= parseFloat(candidate.previewQuantity))
+    .sort((a, b) => (b.holdingValue - a.holdingValue));
+
+  return fallbackCandidates[0] || null;
+}
+
+function writeWormArtifact(payload, modeLabel = 'preview') {
+  const dir = path.join(process.cwd(), 'runs');
+  fs.mkdirSync(dir, { recursive: true });
+  const safeTime = new Date().toISOString().replace(/[:.]/g, '-');
+  const safeProduct = String(payload.productId || 'NONE').replace(/[^A-Z0-9-]/g, '_');
+  const safeSide = String(payload.side || 'unknown').toLowerCase();
+  const safeMode = String(modeLabel || 'preview').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+  const filePath = path.join(dir, `${safeTime}-worm-${safeMode}-${safeSide}-${safeProduct}.json`);
+  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`);
+  return filePath;
+}
+
+function writeWormPreviewArtifact(payload) {
+  return writeWormArtifact(payload, 'preview');
+}
+
+function writeWormLiveArtifact(payload) {
+  return writeWormArtifact(payload, 'live');
+}
+
+function buildHoldingDetails(holdings) {
+  const holdingDetails = {};
+  for (const holding of Array.isArray(holdings) ? holdings : []) {
+    const code = holding?.asset_code;
+    const qty = parseFloat(holding?.total_quantity) || 0;
+    const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10;
+    if (!code || qty <= minQtyThreshold) continue;
+    if (!holdingDetails[code]) holdingDetails[code] = { rawQuantity: 0 };
+    holdingDetails[code].rawQuantity += qty;
+  }
+  return holdingDetails;
+}
+
+async function loadLivePortfolioSnapshot(api) {
+  const cashBalance = await api.getBalance();
+  const holdings = await api.getHoldings();
+  const holdingDetails = buildHoldingDetails(holdings);
+  return { cashBalance, holdings, holdingDetails };
+}
+
+async function runPreviewOrderOnce(engine, api, previewOrder) {
+  const cashBalance = await api.getBalance();
+  const holdings = await api.getHoldings();
+  const holdingDetails = buildHoldingDetails(holdings);
+  const quoteMap = await api.getQuotes([previewOrder.symbol]);
+  const price = quoteMap[previewOrder.symbol];
+  if (!price || !Number.isFinite(price) || price <= 0) {
+    throw new Error(`Could not fetch usable price for ${previewOrder.symbol}`);
+  }
+  const quantity = roundQty(previewOrder.symbol, previewOrder.usdAmount / price);
+  if (!quantity || parseFloat(quantity) <= 0) {
+    throw new Error(`Preview quantity rounded to zero for ${previewOrder.productId}`);
+  }
+  if (previewOrder.side === 'SELL') {
+    const availableQty = holdingDetails[previewOrder.symbol]?.rawQuantity || 0;
+    if (availableQty < parseFloat(quantity)) {
+      throw new Error(`Insufficient ${previewOrder.symbol} for preview sell: need ${quantity}, available ${availableQty}`);
+    }
+  }
+
+  const response = previewOrder.side === 'SELL'
+    ? await engine._placeSell(api, previewOrder.productId, quantity, price)
+    : await engine._placeBuy(api, previewOrder.productId, quantity, price);
+
+  if (!response) {
+    throw new Error(`Worm preview path returned no response for ${previewOrder.side} ${previewOrder.productId}`);
+  }
+
+  const artifactPayload = {
+    generatedAt: new Date().toISOString(),
+    mode: 'worm-preview',
+    side: previewOrder.side,
+    symbol: previewOrder.symbol,
+    productId: previewOrder.productId,
+    usdAmount: previewOrder.usdAmount,
+    cashBalance,
+    availableQuantity: holdingDetails[previewOrder.symbol]?.rawQuantity || 0,
+    previewPrice: price,
+    previewQuantity: quantity,
+    response,
+  };
+  const artifact = writeWormPreviewArtifact(artifactPayload);
+
+  console.log(`🧪 Worm preview ${previewOrder.side} ${previewOrder.productId}`);
+  console.log(`   cash balance: $${cashBalance.toFixed(2)}`);
+  console.log(`   preview price: $${price}`);
+  console.log(`   preview quantity: ${quantity}`);
+  if (response.preview?.order_total || response.preview?.quote_size) {
+    console.log(`   preview total/quote: ${response.preview.order_total || 'n/a'} / ${response.preview.quote_size || 'n/a'}`);
+  }
+  console.log(`   artifact: ${artifact}`);
+
+  return { artifact, artifactPayload };
+}
+
+async function runStrategyPreviewOnce(engine, api, strategyPreview, portfolioSummary, holdingDetails, cashBalance) {
+  const candidate = selectStrategyPreviewCandidate(engine, portfolioSummary, holdingDetails, cashBalance, api, strategyPreview.requestedUsd);
+  if (!candidate) {
+    const artifactPayload = {
+      generatedAt: new Date().toISOString(),
+      mode: 'worm-strategy-preview',
+      selectionMode: 'none',
+      side: 'none',
+      symbol: null,
+      productId: 'NONE',
+      requestedUsd: strategyPreview.requestedUsd,
+      cashBalance,
+      reason: 'no exact live strategy trigger and no fallback candidate met minimum trade constraints',
+    };
+    const artifact = writeWormPreviewArtifact(artifactPayload);
+    console.log('🧠 Worm strategy preview found no eligible candidate.');
+    console.log(`   artifact: ${artifact}`);
+    return { artifact, artifactPayload };
+  }
+
+  const response = candidate.side === 'SELL'
+    ? await engine._placeSell(api, candidate.productId, candidate.previewQuantity, candidate.previewPrice)
+    : await engine._placeBuy(api, candidate.productId, candidate.previewQuantity, candidate.previewPrice);
+
+  if (!response) {
+    throw new Error(`Strategy preview path returned no response for ${candidate.side} ${candidate.productId}`);
+  }
+
+  const artifactPayload = {
+    generatedAt: new Date().toISOString(),
+    mode: 'worm-strategy-preview',
+    selectionMode: candidate.selectionMode,
+    reason: candidate.reason,
+    exactTrigger: candidate.exactTrigger,
+    side: candidate.side,
+    symbol: candidate.symbol,
+    productId: candidate.productId,
+    requestedUsd: strategyPreview.requestedUsd,
+    usdAmount: candidate.usdAmount,
+    cashBalance,
+    availableQuantity: candidate.availableQuantity,
+    previewPrice: candidate.previewPrice,
+    previewQuantity: candidate.previewQuantity,
+    deviationRatio: candidate.deviationRatio,
+    activeHarvestTrigger: candidate.activeHarvestTrigger,
+    activeRebalanceTrigger: candidate.activeRebalanceTrigger,
+    triggerGap: candidate.triggerGap,
+    response,
+  };
+  const artifact = writeWormPreviewArtifact(artifactPayload);
+
+  console.log(`🧠 Worm strategy preview ${candidate.side} ${candidate.productId} [${candidate.selectionMode}]`);
+  console.log(`   reason: ${candidate.reason}`);
+  console.log(`   cash balance: $${cashBalance.toFixed(2)}`);
+  console.log(`   preview price: $${candidate.previewPrice}`);
+  console.log(`   preview quantity: ${candidate.previewQuantity}`);
+  if (response.preview?.order_total || response.preview?.quote_size) {
+    console.log(`   preview total/quote: ${response.preview.order_total || 'n/a'} / ${response.preview.quote_size || 'n/a'}`);
+  }
+  console.log(`   artifact: ${artifact}`);
+
+  return { artifact, artifactPayload };
+}
+
+async function runStrategyPlaceOnce(engine, api, strategyPlace, portfolioSummary, holdingDetails, cashBalance) {
+  const candidate = selectStrategyPreviewCandidate(engine, portfolioSummary, holdingDetails, cashBalance, api, strategyPlace.requestedUsd);
+  if (!candidate) {
+    const artifactPayload = {
+      generatedAt: new Date().toISOString(),
+      mode: 'worm-strategy-live',
+      selectionMode: 'none',
+      side: 'none',
+      symbol: null,
+      productId: 'NONE',
+      requestedUsd: strategyPlace.requestedUsd,
+      cashBalance,
+      reason: 'no exact live strategy trigger and no fallback candidate met minimum trade constraints',
+      orderPlaced: false,
+    };
+    const artifact = writeWormLiveArtifact(artifactPayload);
+    console.log('🧠 Worm strategy live found no eligible candidate.');
+    console.log(`   artifact: ${artifact}`);
+    return { artifact, artifactPayload };
+  }
+
+  const preTradeQuantity = holdingDetails[candidate.symbol]?.rawQuantity || 0;
+  let response = candidate.side === 'SELL'
+    ? await engine._placeSell(api, candidate.productId, candidate.previewQuantity, candidate.previewPrice)
+    : await engine._placeBuy(api, candidate.productId, candidate.previewQuantity, candidate.previewPrice);
+
+  if (!response) {
+    throw new Error(`Strategy live path returned no response for ${candidate.side} ${candidate.productId}`);
+  }
+  if (response.preview_only) {
+    throw new Error(`Strategy live path unexpectedly returned preview-only response for ${candidate.side} ${candidate.productId}`);
+  }
+
+  if (response?.id && String(response?.state || '').toLowerCase() !== 'filled') {
+    const verified = await verifyOrder(api, response.id, candidate.productId, 10, 1500);
+    if (verified) response = verified;
+  }
+  if (String(response?.state || '').toLowerCase() !== 'filled') {
+    throw new Error(`Strategy live path did not confirm FILLED for ${candidate.productId}; last state was '${response?.state || 'unknown'}'`);
+  }
+
+  const effectivePrice = getEffectivePriceFromResp(response, candidate.previewPrice) || candidate.previewPrice;
+  const filledQuantity = getFilledQuantityFromResp(response, candidate.previewQuantity);
+  const grossValue = getGrossValueFromResp(response, candidate.previewQuantity, candidate.previewPrice);
+  const totalFees = getTotalFeesFromResp(response);
+  const settledValue = getSettledValueFromResp(response, candidate.previewQuantity, candidate.previewPrice);
+
+  engine._logTrade({
+    asset: candidate.symbol,
+    side: candidate.side,
+    quantity: filledQuantity.toString(),
+    price: effectivePrice.toString(),
+    clientOrderId: response.client_order_id || response.id,
+    note: `Strategy Live ${candidate.selectionMode}`,
+    grossValue,
+    totalFees,
+    settledValue,
+  });
+
+  engine.lastActionTimestamps[candidate.symbol] = Date.now();
+
+  const postTradeSnapshot = await loadLivePortfolioSnapshot(api);
+  engine.cashBalance = postTradeSnapshot.cashBalance;
+  engine.holdings = postTradeSnapshot.holdingDetails;
+  saveState();
+
+  const artifactPayload = {
+    generatedAt: new Date().toISOString(),
+    mode: 'worm-strategy-live',
+    selectionMode: candidate.selectionMode,
+    reason: candidate.reason,
+    exactTrigger: candidate.exactTrigger,
+    side: candidate.side,
+    symbol: candidate.symbol,
+    productId: candidate.productId,
+    requestedUsd: strategyPlace.requestedUsd,
+    usdAmount: candidate.usdAmount,
+    preTrade: {
+      cashBalance,
+      availableQuantity: preTradeQuantity,
+    },
+    execution: {
+      orderId: response.id,
+      clientOrderId: response.client_order_id || null,
+      state: response.state,
+      averagePrice: effectivePrice,
+      filledQuantity,
+      filledValue: grossValue,
+      totalFees,
+      totalValueAfterFees: settledValue,
+    },
+    postTrade: {
+      cashBalance: postTradeSnapshot.cashBalance,
+      availableQuantity: postTradeSnapshot.holdingDetails[candidate.symbol]?.rawQuantity || 0,
+    },
+    persistedStatePath: STATE_FILE_PATH,
+    tradeHistoryPath: path.join(process.cwd(), 'trade_history.log'),
+    response,
+  };
+  const artifact = writeWormLiveArtifact(artifactPayload);
+
+  console.log(`🧠 Worm strategy LIVE ${candidate.side} ${candidate.productId} [${candidate.selectionMode}]`);
+  console.log(`   reason: ${candidate.reason}`);
+  console.log(`   order state: ${response.state}`);
+  console.log(`   filled quantity: ${filledQuantity}`);
+  console.log(`   gross / fees / settled: ${grossValue} / ${totalFees} / ${settledValue}`);
+  console.log(`   cash balance: $${cashBalance.toFixed(2)} -> $${postTradeSnapshot.cashBalance.toFixed(2)}`);
+  console.log(`   artifact: ${artifact}`);
+
+  return { artifact, artifactPayload, response, postTradeSnapshot };
+}
+
 async function verifyOrder(api, orderId, symbol, maxRetries = 6, delayMs = 1500) {
   if (!api || !orderId) return null;
   console.log(`🔍 [Verification] Starting status polling for order: ${orderId} (${symbol})`);
@@ -2161,198 +2634,6 @@ function saveState() {
     }
   } catch (err) { console.error("🚨 CRITICAL ERROR: Failed to save state:", err.message); }
 }
-
-
-// ============== Robinhood API Wrapper ==============
-class RobinhoodAPI {
-  constructor(apiKey, base64Priv) {
-    this.apiKey = apiKey;
-    this.baseUrl = "https://trading.robinhood.com";
-    this.retryDelay = 60 * 1000;
-    this.requestTimeout = 20 * 1000;
-    this.timeOffset = 0; // Correction in milliseconds (Server - Local)
-    this.lastSpreads = {}; // Cache for live bid/ask spreads
-
-    const raw = Buffer.from(base64Priv, "base64");
-    let keyPairSource;
-    if (raw.length === 32) {
-      keyPairSource = nacl.sign.keyPair.fromSeed(raw);
-    } else if (raw.length === 64) {
-      keyPairSource = nacl.sign.keyPair.fromSecretKey(raw);
-    } else {
-      throw new Error("Private key must be 32 (seed) or 64 (secret key) bytes");
-    }
-    this.keyPair = keyPairSource;
-  }
-
-  _timestamp() {
-    // Apply offset to sync with server time
-    return Math.floor((Date.now() + this.timeOffset) / 1000);
-  }
-
-  _sign(msg) {
-    const sig = nacl.sign.detached(Buffer.from(msg, "utf8"), this.keyPair.secretKey);
-    return Buffer.from(sig).toString("base64");
-  }
-
-  async _request(method, path, bodyObj = null) {
-    const t = this._timestamp();
-    const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
-    const toSign = this.apiKey + t + path + method + bodyStr;
-    const signature = this._sign(toSign);
-    const headers = {
-      "x-api-key": this.apiKey,
-      "x-signature": signature,
-      "x-timestamp": String(t),
-      "Content-Type": "application/json",
-      "Accept": "application/json"
-    };
-    const url = this.baseUrl + path;
-    const config = {
-      method: method,
-      url: url,
-      headers: headers,
-      timeout: this.requestTimeout,
-      ...(bodyObj && { data: bodyObj }),
-    };
-    const resp = await axios(config);
-    return resp.data;
-  }
-
-  async _requestWithRetry(method, path, bodyObj = null) {
-    while (true) {
-      try {
-        return await this._request(method, path, bodyObj);
-      } catch (err) {
-        const status = err.response?.status;
-        const code = err.code;
-
-        // --- AUTO-CORRECT TIME SYNC ---
-        // Handle "Timestamp is invalid" (401) by syncing with Server Date Header
-        const errorDataStr = JSON.stringify(err.response?.data || "");
-        if (status === 401 && (errorDataStr.includes("Timestamp") || errorDataStr.includes("timestamp"))) {
-          const serverDateStr = err.response.headers ? (err.response.headers['date'] || err.response.headers['Date']) : null;
-          if (serverDateStr) {
-            const serverTime = Date.parse(serverDateStr);
-            const localTime = Date.now();
-            if (!isNaN(serverTime)) {
-              const drift = serverTime - localTime;
-              console.log(`🕒 Clock Drift Detected! Local: ${new Date(localTime).toISOString()} | Server: ${serverDateStr}`);
-              console.log(`   🛠️ Adjusting internal clock by ${drift > 0 ? '+' : ''}${drift}ms to sync.`);
-              this.timeOffset = drift;
-
-              // Wait a moment and retry immediately
-              await new Promise(res => setTimeout(res, 1000));
-              continue;
-            }
-          }
-        }
-
-        // Handle 400 Validation Errors (Graceful Failures)
-        if (status === 400 && err.response?.data?.errors) {
-          const errors = err.response.data.errors;
-          // 1. Duplicate Order ID
-          const isDuplicate = errors.some(e => e.attr === 'client_order_id' && e.detail && e.detail.includes('Already used'));
-          if (isDuplicate) {
-            console.warn(`⚠️ API Warning (${path}): Order already placed (Client Order ID collision). Assuming success.`);
-            return null;
-          }
-          // 2. Insufficient Funds (Buying Power)
-          const isInsuffFunds = errors.some(e => e.detail && e.detail.includes('Not enough buying power'));
-          if (isInsuffFunds) {
-            console.warn(`⚠️ API Warning (${path}): Insufficient buying power. Skipping order.`);
-            return null; // Return null to skip without crashing
-          }
-          // 3. Invalid Quantity (Min Order Size)
-          const isInvalidQty = errors.some(e => e.detail && (e.detail.includes('must be greater than or equal to') || e.detail.includes('increment')));
-          if (isInvalidQty) {
-            console.warn(`⚠️ API Warning (${path}): Invalid quantity/increment. Skipping order. Error: ${JSON.stringify(errors)}`);
-            return null;
-          }
-        }
-
-        const isTimeout = code === "ECONNABORTED" || err.message.toLowerCase().includes('timeout');
-        const isNetworkError = ["ECONNRESET", "ENOTFOUND", "ETIMEDOUT", "EAI_AGAIN", "ECONNREFUSED"].includes(code);
-        const isRetryableStatus = status && (status >= 500 && status <= 599);
-        const isRateLimit = status === 429;
-        const isForbidden = status === 403;
-
-        if (isTimeout || isNetworkError || isRetryableStatus || isRateLimit || isForbidden) {
-          const errorType = isTimeout ? "timeout" : isNetworkError ? `network error (${code || 'N/A'})` : isRetryableStatus ? `server error (${status})` : isRateLimit ? `rate limit (429)` : isForbidden ? `forbidden (403)` : `other retryable error`;
-          console.log(`⏳ API Error (${path}): ${errorType}. Retrying in ${this.retryDelay / 1000}s...`);
-          await new Promise((res) => setTimeout(res, this.retryDelay));
-        } else {
-          console.error(`❌ API Error (${path}): Non-retryable error: Status=${status || 'N/A'}, Code=${code || 'N/A'}, Message=${err.message}`);
-          if (err.response?.data) {
-            console.error("Response Data:", JSON.stringify(err.response.data, null, 2));
-          }
-          throw err;
-        }
-      }
-    }
-  }
-  async getBalance() { const data = await this._requestWithRetry("GET", "/api/v1/crypto/trading/accounts/"); if (!data) return 0; const account = Array.isArray(data.results) ? data.results[0] : data; if (!account) return 0; const fields = ["buying_power", "cash_balance", "crypto_buying_power"]; for (const field of fields) { if (account[field] !== undefined && account[field] !== null) { const balance = parseFloat(account[field]); return !isNaN(balance) ? balance : 0; } } console.warn("[getBalance] Could not find a recognizable balance field in response:", account); return 0; }
-  async getHoldings() {
-    let holdings = [];
-    let nextUrl = "/api/v1/crypto/trading/holdings/";
-    while (nextUrl) {
-      const urlPath = nextUrl.includes("trading.robinhood.com")
-        ? nextUrl.split("trading.robinhood.com")[1]
-        : nextUrl;
-      const data = await this._requestWithRetry("GET", urlPath);
-      if (data && data.results) {
-        holdings = holdings.concat(data.results);
-      }
-      nextUrl = data?.next || null;
-    }
-    return holdings;
-  }
-  async getQuotes(assetCodes) {
-    if (!Array.isArray(assetCodes) || assetCodes.length === 0) return {};
-    const data = await this._requestWithRetry("GET", "/api/v1/crypto/marketdata/best_bid_ask/");
-    const quotes = data?.results || [];
-    const result = {};
-    const codesSet = new Set(assetCodes);
-    if (!this.lastSpreads) this.lastSpreads = {};
-    for (const quote of quotes) {
-      const sym = quote.symbol?.replace("-USD", "");
-      if (sym) {
-        const buySpread = parseFloat(quote.buy_spread);
-        const sellSpread = parseFloat(quote.sell_spread);
-        if (!isNaN(buySpread) && !isNaN(sellSpread)) {
-          this.lastSpreads[sym] = { buy: buySpread, sell: sellSpread };
-        }
-        if (codesSet.has(sym)) {
-          const rawPrice = parseFloat(quote.price);
-          if (!isNaN(rawPrice) && rawPrice > 0) {
-            result[sym] = Number(rawPrice.toFixed(10));
-          } else {
-            console.warn(`[getQuotes] Invalid price received for ${sym}: ${quote.price}`);
-            result[sym] = 0;
-          }
-        }
-      }
-    }
-    assetCodes.forEach(code => {
-      if (!(code in result)) {
-        console.warn(`[getQuotes] No quote data found for requested asset: ${code}`);
-      }
-    });
-    return result;
-  }
-  async getOrderStatus(orderId) { const path = `/api/v1/crypto/trading/orders/${orderId}/`; return this._requestWithRetry("GET", path); }
-
-  _validateOrderParams(symbol, quantityStr, side) {
-    if (!symbol || !symbol.includes("-USD")) { throw new Error(`Invalid symbol format: '${symbol}'. Must be like 'BTC-USD'.`); }
-    const qtyNum = parseFloat(quantityStr);
-    if (isNaN(qtyNum) || qtyNum <= 0) { throw new Error(`Invalid quantity for ${side} order: '${quantityStr}'. Must be a positive number.`); }
-    return qtyNum;
-  }
-  async placeSell(symbol, quantityStr) { this._validateOrderParams(symbol, quantityStr, 'sell'); const path = "/api/v1/crypto/trading/orders/"; const body = { client_order_id: crypto.randomUUID(), side: "sell", type: "market", symbol, market_order_config: { asset_quantity: quantityStr } }; console.log(`📦 Placing SELL order: ${quantityStr} ${symbol.replace("-USD", "")}`); return this._requestWithRetry("POST", path, body); }
-  async placeBuy(symbol, quantityStr) { this._validateOrderParams(symbol, quantityStr, 'buy'); const path = "/api/v1/crypto/trading/orders/"; const body = { client_order_id: crypto.randomUUID(), side: "buy", type: "market", symbol, market_order_config: { asset_quantity: quantityStr } }; console.log(`📦 Placing BUY order: ${quantityStr} ${symbol.replace("-USD", "")}`); return this._requestWithRetry("POST", path, body); }
-}
-
-
 // ============== Main Application Logic ==============
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -2363,12 +2644,26 @@ async function mainLoop() {
   pruneMarketDataFile(); // Run HDD-safe pruning once on startup
   console.log("🚀 Initializing Cryptobot Token Flex (v4.0.0 - Shadow Engine Architecture)...");
 
-  const apiKey = process.env.API_KEY;
-  const privKey = process.env.PRIVATE_KEY_BASE64;
-  if (!apiKey || !privKey) { console.error("❌ FATAL: Missing API_KEY or PRIVATE_KEY_BASE64 environment variables."); rl.close(); return; }
+  const dryRunOnce = process.argv.includes('--dry-run-once');
+  const previewOrder = parsePreviewOrderArgs(process.argv);
+  const strategyPreview = parseStrategyPreviewArgs(process.argv);
+  const strategyPlace = parseStrategyPlaceArgs(process.argv);
+  const previewMode = Boolean(previewOrder || strategyPreview);
+  const readOnly = dryRunOnce || process.env.WORM_READ_ONLY === '1';
+
+  if (strategyPlace && process.env.ALLOW_LIVE_TRADE !== '1') {
+    throw new Error('Refusing --place-strategy without ALLOW_LIVE_TRADE=1');
+  }
+  if (strategyPlace && !strategyPlace.confirm) {
+    throw new Error('Refusing --place-strategy without --yes confirmation');
+  }
 
   let rh;
-  try { rh = new RobinhoodAPI(apiKey, privKey); console.log("🔑 API Initialized."); }
+  try {
+    rh = new CoinbaseWormAPI({ readOnly, previewOnly: previewMode });
+    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : readOnly ? ' [READ-ONLY]' : '';
+    console.log(`🔑 Coinbase API Initialized${modeLabel}.`);
+  }
   catch (error) { console.error("❌ FATAL: API initialization failed:", error.message); rl.close(); return; }
 
   // --- Initialize Live Engine ---
@@ -2434,6 +2729,16 @@ async function mainLoop() {
   }
 
   console.log("🧬 Live Engine Genome Loaded.");
+
+  if (previewOrder) {
+    await runPreviewOrderOnce(liveEngine, rh, previewOrder);
+    rl.close();
+    return;
+  }
+
+  if (strategyPlace) {
+    console.log('⚠️ Guarded live strategy mode enabled. One strategy-selected live order will be allowed this run.');
+  }
 
   // Inject Global Price History into Live Engine for Shadows to share
   if (typeof priceHistory !== 'undefined') {
@@ -2690,8 +2995,10 @@ async function mainLoop() {
     return worker;
   }
 
-  for (let i = 0; i < totalWorkers; i++) {
-    dreamerGrid.push(spawnWorker(i));
+  if (!dryRunOnce && !strategyPreview && !strategyPlace) {
+    for (let i = 0; i < totalWorkers; i++) {
+      dreamerGrid.push(spawnWorker(i));
+    }
   }
   let lastStateSaveTime = 0; // Fix: Initialize variable to prevent ReferenceError
   let lastHistoryRefreshTime = Date.now(); // Track when we last refreshed history
@@ -2739,7 +3046,7 @@ async function mainLoop() {
 
   // 4. The Legion Manager (Broad Present)
   // Orchestrates Shadows and dispatches orders to Dreamers
-  const legionManager = new LegionManager(liveEngine, TradingEngine, dreamerGrid);
+  const legionManager = (dryRunOnce || strategyPreview || strategyPlace) ? null : new LegionManager(liveEngine, TradingEngine, dreamerGrid);
 
   // Inject dependencies into global scope/main loop variables helper if needed?
   // We declared them as const here. They need to be accessible in the loop.
@@ -3013,7 +3320,7 @@ async function mainLoop() {
 
     // --- STARTUP OPTIMIZATION TRIGGER ---
     // Since we have history, we ask the Dreamers to optimize ALL active assets immediately on boot.
-    if (!global.hasTriggeredStartupOptimization && portfolioSummary.length > 0) {
+    if (!global.hasTriggeredStartupOptimization && portfolioSummary.length > 0 && legionManager) {
       console.log("\n🚀 [STARTUP] Triggering Mass Scientific Optimization for all assets...");
       portfolioSummary.forEach(row => {
         if (!HARVEST_EXCLUDE.includes(row.Symbol)) { // Respect Exclusions
@@ -3211,6 +3518,16 @@ async function mainLoop() {
       });
     }
 
+    if (strategyPreview) {
+      await runStrategyPreviewOnce(liveEngine, rh, strategyPreview, portfolioSummary, holdingDetails, cashBalance);
+      break;
+    }
+
+    if (strategyPlace) {
+      await runStrategyPlaceOnce(liveEngine, rh, strategyPlace, portfolioSummary, holdingDetails, cashBalance);
+      break;
+    }
+
     // --- Auto Trading Logic ---
     if (portfolioSummary.length === 0 || !initialized) {
       console.log("⏳ Skipping trading actions (Portfolio empty or not initialized).\n");
@@ -3316,12 +3633,18 @@ async function mainLoop() {
 
     // --- Cycle Timing (Unchanged) ---
     const endTime = Date.now(); const elapsed = endTime - startTime; const delay = Math.max(0, currentGenome.REFRESH_INTERVAL - elapsed);
+    if (dryRunOnce || strategyPreview || strategyPlace) {
+      const completionLabel = strategyPlace ? 'Strategy live cycle' : strategyPreview ? 'Strategy preview cycle' : 'Dry run cycle';
+      const completionReason = strategyPlace ? 'Exiting after one guarded strategy-selected live Coinbase order.' : strategyPreview ? 'Exiting after one strategy-selected Coinbase preview.' : 'Exiting after one read-only Coinbase cycle.';
+      console.log(`----- ${completionLabel} end: Took ${elapsed}ms. ${completionReason} -----`);
+      break;
+    }
     console.log(`----- Cycle End: Took ${elapsed}ms. Waiting ${delay}ms... -----`);
     await new Promise((res) => setTimeout(res, delay));
 
   } // End Main Loop
 
-  console.log("🛑 Main loop exited unexpectedly."); rl.close();
+  console.log(strategyPlace ? "🛑 Strategy live run complete." : strategyPreview ? "🛑 Strategy preview complete." : dryRunOnce ? "🛑 Read-only dry run complete." : "🛑 Main loop exited unexpectedly."); rl.close();
 } // End mainLoop Function
 
 
@@ -4242,7 +4565,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     });
   }
 }
-export { TradingEngine, RobinhoodAPI, defaultGenome, ScientificOptimizer };
+export { TradingEngine, CoinbaseWormAPI, defaultGenome, ScientificOptimizer };
 
 
 // ==================== Change Log ====================
