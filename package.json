@@ -6,7 +6,9 @@
   "scripts": {
     "test": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && node portfolio.js --help >/dev/null && node agent-trader.js --help >/dev/null",
     "portfolio": "node portfolio.js",
-    "agent:preview-sell-btc": "node agent-trader.js preview-sell BTC 10"
+    "agent:preview-sell-btc": "node agent-trader.js preview-sell BTC 10",
+    "regime": "node regime.js",
+    "regime:all": "node regime.js --all"
   },
   "keywords": [],
   "author": "",
