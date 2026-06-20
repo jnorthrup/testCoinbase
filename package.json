@@ -12,10 +12,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@coinbase/cdp-sdk": "^1.51.2",
-    "@coinbase/coinbase-sdk": "^0.25.0",
-    "dotenv": "^17.4.2",
-    "jose": "^6.2.3",
     "jsonwebtoken": "^9.0.3"
   }
 }
