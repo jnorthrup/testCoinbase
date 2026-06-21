@@ -9,6 +9,21 @@ import readline from 'readline';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
+import {
+  minIncrementMap, SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
+  PRECISION_THRESHOLD, SNOWBALL_CONFIG, defaultGenome, getFallbackMinQty,
+} from '../config/constants.mjs';
+import { roundQty, checkMinQuantity, setMinOrderQtyMap, getMinOrderQtyMap } from '../utils/quantity.mjs';
+import {
+  getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
+  getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
+} from '../utils/helpers.mjs';
+const MIN_ORDER_QTY_MAP = new Proxy({}, {
+  get(_, k)  { return getMinOrderQtyMap()[k]; },
+  ownKeys()  { return Object.keys(getMinOrderQtyMap()); },
+  has(_, k)  { return k in getMinOrderQtyMap(); },
+  getOwnPropertyDescriptor(_, k) { return Object.getOwnPropertyDescriptor(getMinOrderQtyMap(), k); },
+});
 
 export class TradingEngine {
   constructor(genome, mode = 'SHADOW', initialCapital = 0, initialHoldings = {}) {
