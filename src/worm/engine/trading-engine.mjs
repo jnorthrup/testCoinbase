@@ -1,28 +1,16 @@
-import crypto from 'crypto';
-import { LEGION_CONFIG } from '../config/legion-config.mjs';
-import {
-  HARVEST_EXCLUDE,
-  MIN_ORDER_QTY_MAP,
-  PRECISION_THRESHOLD,
-  REBALANCE_EXCLUDE,
-  SLIPPAGE_BUFFERS,
-  SNOWBALL_CONFIG,
-} from '../config/trading-config.mjs';
-import {
-  checkMinQuantity,
-  checkMinTrade,
-  getEffectivePriceFromResp,
-  getFilledQuantityFromResp,
-  getGenomicParam,
-  getGrossValueFromResp,
-  getSettledValueFromResp,
-  getTotalFeesFromResp,
-  logTrade,
-  roundQty,
-  verifyOrder,
-} from '../utils/trading-helpers.mjs';
+// Lifted from robinhood-worm.js — Python array scissor.
+// Full shared imports cloned. DCE later.
 
-class TradingEngine {
+import dotenv from 'dotenv';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import readline from 'readline';
+import os from 'os';
+import { fileURLToPath } from 'url';
+import { fork } from 'child_process';
+
+export class TradingEngine {
   constructor(genome, mode = 'SHADOW', initialCapital = 0, initialHoldings = {}) {
     this.genome = { ...genome };
     this.mode = mode; // 'LIVE' or 'SHADOW'
@@ -53,6 +41,7 @@ class TradingEngine {
     // --- Risk Metrics ---
     this.peakTotalValue = initialCapital;
     this.maxDrawdownPercent = 0.0;
+    this.initialCapital = initialCapital; // $0 for LIVE; set from first portfolio value on boot
 
     this.priceHistory = {}; // Engine-local price history
     this.priceHistoryBuffer = []; // Global high-res history (LIVE only) or Simulation history (SHADOW)
@@ -76,6 +65,9 @@ class TradingEngine {
       this.genome = { ...this.genome, ...data.genome };
       this.genome.REINVEST_COOLDOWN_QUEUE_SIZE = 15; // Enforce 15-token queue size
     }
+    if (data.initialCapital !== undefined && data.initialCapital > 0) this.initialCapital = data.initialCapital;
+    if (data.peakTotalValue !== undefined && data.peakTotalValue > 0) this.peakTotalValue = data.peakTotalValue;
+    if (data.maxDrawdownPercent !== undefined) this.maxDrawdownPercent = data.maxDrawdownPercent;
   }
 
   getStateSnapshot() {
@@ -93,7 +85,10 @@ class TradingEngine {
       // Include Dreamer promotion threshold & visual metadata for persistence
       lastBestScore: global.lastBestScore || 1.0,
       assetSourceTimeframe: this.assetSourceTimeframe || {},
-      overflowTarget: SNOWBALL_CONFIG.OVERFLOW_TARGET
+      overflowTarget: SNOWBALL_CONFIG.OVERFLOW_TARGET,
+      initialCapital: this.initialCapital,
+      peakTotalValue: this.peakTotalValue,
+      maxDrawdownPercent: this.maxDrawdownPercent
     };
   }
 
@@ -193,6 +188,9 @@ class TradingEngine {
     if (this.mode === 'LIVE' && api) {
       try {
         const resp = await api.placeSell(symbol, quantity);
+        if (resp?.preview_only) {
+          return resp;
+        }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
           return verified || resp;
@@ -233,6 +231,9 @@ class TradingEngine {
     if (this.mode === 'LIVE' && api) {
       try {
         const resp = await api.placeBuy(symbol, quantity);
+        if (resp?.preview_only) {
+          return resp;
+        }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
           return verified || resp;
@@ -1271,10 +1272,107 @@ class TradingEngine {
       }
 
       // ========================================================
-            // CRASH PROTECTION CHECK (No spawner here - unified in main loop)
-            // ========================================================
-            let isGlobalRiskSignalActive = false;
-            if (currentGenome.ENABLE_CRASH_PROTECTION) {
+      // 🐛 THE HYBRID "STABLECOIN SNOWBALL BANK" & "WORM SPAWNER" ENGINE
+      // ========================================================
+      const activeHoldings = holdingDetails || this.holdings;
+      const currentTotalPortfolioValue = portfolioSummary.reduce((sum, r) => sum + r.Value, 0) + this.cashBalance;
+      const crashFundThreshold = currentGenome.CRASH_FUND_THRESHOLD_PERCENT ?? 0.10;
+      const crashFundUSD = currentTotalPortfolioValue * crashFundThreshold;
+      const spawnCost = SNOWBALL_CONFIG.MIN_SPAWN_COST_USD || 30.00;
+
+      // Find next unheld queue token (fluid horizontal expansion)
+      const nextSym = Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
+        !HARVEST_EXCLUDE.includes(sym) &&
+        (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
+        (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0)
+      );
+
+      if (nextSym) {
+        if (this.cashBalance >= crashFundUSD + spawnCost) {
+          if (this.mode === 'LIVE') {
+            console.log(`🐛 [MITOSIS SPAWNER] Cash balance $${this.cashBalance.toFixed(2)} is >= Crash Fund ($${crashFundUSD.toFixed(2)}) + Spawn Cost ($${spawnCost.toFixed(2)}).`);
+            console.log(`   → Spawning new asset grid: ${nextSym}. Mitosis starting...`);
+            try {
+              // A. Initialize baseline & timestamp
+              tokenBaselines[nextSym] = spawnCost;
+              lastActionTimestamps[nextSym] = now;
+              stateChanged = true;
+
+              // B. Execute 100% Spawn Buy (market buy 100% of spawnCost)
+              const hydrationCost = spawnCost;
+              const buyP = portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym];
+
+              if (!buyP || buyP <= 0) {
+                console.warn(`⚠️ [MITOSIS] Could not fetch price for ${nextSym}, skipping spawn`);
+              } else {
+                const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
+
+                if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
+                  console.log(`   → Placing 100% spawn buy for ${buyQtyStr} ${nextSym}...`);
+                  const buyResp = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
+                  if (buyResp?.id) {
+                    const confirmedBuy = buyResp;
+                    if (confirmedBuy) {
+                      const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
+                      const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
+                      const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP) || buyP;
+
+                      // slippage
+                      const slippage = (effectivePrice - buyP) / buyP;
+                      const sym = nextSym;
+                      if (!this.ratchetState[sym]) {
+                        this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
+                      }
+                      this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                      const actualCost = filledQty * effectivePrice;
+
+                      this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
+
+                      // Initialize Cost Basis for Newly Spawned Asset
+                      this.ratchetState[nextSym] = {
+                        harvestModifier: 0.0,
+                        rebalanceModifier: 0.0,
+                        lastTradeSide: 'BUY',
+                        localCostBasis: effectivePrice,
+                        localQty: filledQty
+                      };
+                      console.log(`📈 [COST BASIS] ${nextSym} Spawn Hydrated! Qty: ${filledQty.toFixed(4)} @ $${effectivePrice.toFixed(8)}. Initialized Cost Basis: $${effectivePrice.toFixed(8)}`);
+
+                      anyTradesThisCycle = true;
+
+                      this.cashBalance -= actualCost;
+                      if (this.cashBalance < 0) this.cashBalance = 0;
+                      if (this.mode === 'LIVE') saveState();
+                      console.log(`   ✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              console.error("❌ [MITOSIS] Failed to execute spawn:", err.message);
+            }
+          } else if (this.mode === 'SHADOW') {
+            // Shadow Spawner Simulation (Instant)
+            tokenBaselines[nextSym] = spawnCost;
+            lastActionTimestamps[nextSym] = now;
+            anyTradesThisCycle = true;
+
+            const hydrationCost = spawnCost;
+            const buyP = (priceMap && priceMap[nextSym]) || portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym] || 1.00;
+            const buyQty = hydrationCost / buyP;
+
+            if (!this.holdings[nextSym]) this.holdings[nextSym] = { rawQuantity: 0 };
+            this.holdings[nextSym].rawQuantity += buyQty;
+            this.cashBalance -= (spawnCost * 1.01); // 1% buy fee in shadow
+          }
+        }
+      }
+
+      // Return state updates
+      this.portfolioHarvestState = portfolioHarvestState;
+
+      // Tier 1: Min Trade Enforcement (Counters)
+      if (anyTradesThisCycle) {
         this.cyclesWithoutTrade = 0;
       } else {
         this.cyclesWithoutTrade++;
@@ -1292,8 +1390,7 @@ class TradingEngine {
         anyTradesThisCycle,
         harvestedAmount,
         tradedSymbols: this.cycleTrades || [],
-        postMortemEvents: this.postMortemEvents,
-        holdings: this.holdings
+        postMortemEvents: this.postMortemEvents
       };
     }
 
@@ -1306,5 +1403,3 @@ class TradingEngine {
     };
   }
 }
-
-export { TradingEngine };
