@@ -1271,103 +1271,10 @@ class TradingEngine {
       }
 
       // ========================================================
-      // 🐛 THE HYBRID "STABLECOIN SNOWBALL BANK" & "WORM SPAWNER" ENGINE
-      // ========================================================
-      const activeHoldings = holdingDetails || this.holdings;
-      const currentTotalPortfolioValue = portfolioSummary.reduce((sum, r) => sum + r.Value, 0) + this.cashBalance;
-      const crashFundThreshold = currentGenome.CRASH_FUND_THRESHOLD_PERCENT ?? 0.10;
-      const crashFundUSD = currentTotalPortfolioValue * crashFundThreshold;
-      const spawnCost = SNOWBALL_CONFIG.MIN_SPAWN_COST_USD || 30.00;
-
-      // Find next unheld queue token (fluid horizontal expansion)
-      const nextSym = Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
-        !HARVEST_EXCLUDE.includes(sym) &&
-        (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
-        (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0)
-      );
-
-      if (nextSym) {
-        if (this.cashBalance >= crashFundUSD + spawnCost) {
-          if (this.mode === 'LIVE') {
-            console.log(`🐛 [MITOSIS SPAWNER] Cash balance $${this.cashBalance.toFixed(2)} is >= Crash Fund ($${crashFundUSD.toFixed(2)}) + Spawn Cost ($${spawnCost.toFixed(2)}).`);
-            console.log(`   → Spawning new asset grid: ${nextSym}. Mitosis starting...`);
-            try {
-              // A. Initialize baseline & timestamp
-              tokenBaselines[nextSym] = spawnCost;
-              lastActionTimestamps[nextSym] = now;
-              stateChanged = true;
-
-              // B. Execute 100% Spawn Buy (market buy 100% of spawnCost)
-              const hydrationCost = spawnCost;
-              // Attempt to fetch price or default to 1.00
-              const buyP = portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym] || 1.00;
-              const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
-
-              if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
-                console.log(`   → Placing 100% spawn buy for ${buyQtyStr} ${nextSym}...`);
-                const buyResp = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
-                if (buyResp?.id) {
-                  const confirmedBuy = buyResp;
-                  if (confirmedBuy) {
-                    const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
-                    const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
-                    const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP) || buyP;
-
-                    // Measure and update lastSlippage
-                    const slippage = (effectivePrice - buyP) / buyP;
-                    const sym = nextSym;
-                    if (!this.ratchetState[sym]) {
-                      this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
-                    }
-                    this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                    const actualCost = filledQty * effectivePrice;
-
-                    this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
-
-                    // Initialize Cost Basis for Newly Spawned Asset
-                    this.ratchetState[nextSym] = {
-                      harvestModifier: 0.0,
-                      rebalanceModifier: 0.0,
-                      lastTradeSide: 'BUY',
-                      localCostBasis: effectivePrice,
-                      localQty: filledQty
-                    };
-                    console.log(`📈 [COST BASIS] ${nextSym} Spawn Hydrated! Qty: ${filledQty.toFixed(4)} @ $${effectivePrice.toFixed(8)}. Initialized Cost Basis: $${effectivePrice.toFixed(8)}`);
-
-                    anyTradesThisCycle = true;
-
-                    this.cashBalance -= actualCost;
-                    if (this.cashBalance < 0) this.cashBalance = 0;
-                    if (this.mode === 'LIVE' && globalThis.globalSaveEngineState) globalThis.globalSaveEngineState();
-                    console.log(`   ✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
-                  }
-                }
-              }
-            } catch (err) {
-              console.error("❌ [MITOSIS] Failed to execute spawn:", err.message);
-            }
-          } else if (this.mode === 'SHADOW') {
-            // Shadow Spawner Simulation (Instant)
-            tokenBaselines[nextSym] = spawnCost;
-            lastActionTimestamps[nextSym] = now;
-            anyTradesThisCycle = true;
-
-            const hydrationCost = spawnCost;
-            const buyP = (priceMap && priceMap[nextSym]) || portfolioSummary.find(r => r.Symbol === nextSym)?.Price || 1.00;
-            const buyQty = hydrationCost / buyP;
-
-            if (!this.holdings[nextSym]) this.holdings[nextSym] = { rawQuantity: 0 };
-            this.holdings[nextSym].rawQuantity += buyQty;
-            this.cashBalance -= (spawnCost * 1.01); // 1% buy fee in shadow
-          }
-        }
-      }
-
-      // Return state updates
-      this.portfolioHarvestState = portfolioHarvestState;
-
-      // Tier 1: Min Trade Enforcement (Counters)
-      if (anyTradesThisCycle) {
+            // CRASH PROTECTION CHECK (No spawner here - unified in main loop)
+            // ========================================================
+            let isGlobalRiskSignalActive = false;
+            if (currentGenome.ENABLE_CRASH_PROTECTION) {
         this.cyclesWithoutTrade = 0;
       } else {
         this.cyclesWithoutTrade++;
@@ -1385,7 +1292,8 @@ class TradingEngine {
         anyTradesThisCycle,
         harvestedAmount,
         tradedSymbols: this.cycleTrades || [],
-        postMortemEvents: this.postMortemEvents
+        postMortemEvents: this.postMortemEvents,
+        holdings: this.holdings
       };
     }
 

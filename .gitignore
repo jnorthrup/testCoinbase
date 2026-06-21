@@ -24,7 +24,6 @@ configs/asset_regime_memory.json
 .env.*
 !.env.example
 !.env.*.example
-*.pem
 *.key
 *.p8
 *.p12
@@ -43,5 +42,5 @@ configs/asset_regime_memory.json
 coinbase-client.js
 trade-client.js
 
-# separate scaffold/nested git repo; keep out of this trading-client repo
+# separate scaffold/nested git repo
 cdp-app-react/

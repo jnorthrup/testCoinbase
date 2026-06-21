@@ -116,7 +116,7 @@ function parseMaybeJson(text) {
   }
 }
 
-function request({ method = 'GET', requestPath, query, body, credentials = loadCredentials() }) {
+function request({ method = 'GET', requestPath, query, body, credentials = loadCredentials(), retries = 3, retryDelay = 1000 }) {
   const pathWithQuery = appendQuery(toBrokeragePath(requestPath), query);
   const token = buildJwt({
     method,
@@ -126,44 +126,52 @@ function request({ method = 'GET', requestPath, query, body, credentials = loadC
   });
   const payload = body === undefined ? undefined : JSON.stringify(body);
 
-  return new Promise((resolve, reject) => {
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    };
-    if (payload !== undefined) {
-      headers['Content-Length'] = Buffer.byteLength(payload);
-    }
+  function attempt(attemptNum) {
+    return new Promise((resolve, reject) => {
+      const headers = {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      };
+      if (payload !== undefined) {
+        headers['Content-Length'] = Buffer.byteLength(payload);
+      }
 
-    const req = https.request(
-      {
-        hostname: API_HOST,
-        path: pathWithQuery,
-        method: method.toUpperCase(),
-        headers,
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (chunk) => {
-          raw += chunk;
-        });
-        res.on('end', () => {
-          const parsed = parseMaybeJson(raw);
-          const response = { statusCode: res.statusCode, headers: res.headers, body: parsed, requestPath: pathWithQuery };
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(response);
-          } else {
-            reject(new CoinbaseApiError(res.statusCode, raw, pathWithQuery));
-          }
-        });
-      },
-    );
+      const req = https.request(
+        {
+          hostname: API_HOST,
+          path: pathWithQuery,
+          method: method.toUpperCase(),
+          headers,
+        },
+        (res) => {
+          let raw = '';
+          res.on('data', (chunk) => { raw += chunk; });
+          res.on('end', () => {
+            const parsed = parseMaybeJson(raw);
+            const response = { statusCode: res.statusCode, headers: res.headers, body: parsed, requestPath: pathWithQuery };
+            
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(response);
+            } else if (res.statusCode === 429 && attemptNum < retries) {
+              // Rate limited - exponential backoff
+              const delay = retryDelay * Math.pow(2, attemptNum - 1);
+              console.warn(`⚠️ Rate limited (429), retrying in ${delay}ms... (attempt ${attemptNum}/${retries})`);
+              setTimeout(() => attempt(attemptNum + 1).then(resolve).catch(reject), delay);
+            } else {
+              reject(new CoinbaseApiError(res.statusCode, raw, pathWithQuery));
+            }
+          });
+        },
+      );
 
-    req.on('error', reject);
-    if (payload !== undefined) req.write(payload);
-    req.end();
-  });
+      req.on('error', reject);
+      if (payload !== undefined) req.write(payload);
+      req.end();
+    });
+  }
+
+  return attempt(1);
 }
 
 function createClient(credentials = loadCredentials()) {
@@ -175,7 +183,52 @@ function createClient(credentials = loadCredentials()) {
     previewOrder: (body) => request({ method: 'POST', requestPath: 'orders/preview', body, credentials }).then((r) => r.body),
     createOrder: (body) => request({ method: 'POST', requestPath: 'orders', body, credentials }).then((r) => r.body),
     getOrder: (orderId) => request({ method: 'GET', requestPath: `orders/historical/${orderId}`, credentials }).then((r) => r.body),
+    getProducts: () => request({ method: 'GET', requestPath: 'products', credentials }).then((r) => r.body),
   };
+}
+
+// PERP/ETF/Index exclusion lists — assets that look like spot but are derivatives or synthetic
+const PERP_EXCLUDE = new Set([
+  // Perpetual futures products (Coinbase International)
+  // Advanced Trade doesn't list perps on main endpoint, but just in case
+]);
+
+const ETF_EXCLUDE = new Set([
+  // Leveraged ETFs / synthetic tokens (if any appear on spot)
+  'BTC2X', 'BTC3X', 'ETH2X', 'ETH3X', 'BTCBEAR', 'ETHBEAR', 'BTCBULL', 'ETHBULL',
+  'BTCUP', 'BTCDOWN', 'ETHUP', 'ETHDOWN', // Binance-style leveraged tokens
+  'INDEX', 'DEFIINDX', // Index tokens
+]);
+
+const INDEX_EXCLUDE = new Set([
+  // Explicit index products
+  'CCI30', 'DEFI10', 'BLOXROUTE', // Example index tokens
+]);
+
+async function buildMinOrderQtyMap(client = null) {
+  const c = client || createClient();
+  const resp = await c.getProducts();
+  const products = resp?.products || [];
+  
+  const map = {};
+  for (const p of products) {
+    // Only online USD pairs
+    if (p.status !== 'online' || !p.product_id?.endsWith('-USD')) continue;
+    
+    // Extract base currency from product_id (e.g., "BTC-USD" -> "BTC")
+    const base = p.product_id.split('-')[0];
+    const inc = p.base_increment;
+    
+    if (!base || !inc) continue;
+    
+    // Skip perps, ETFs, indexes
+    if (PERP_EXCLUDE.has(base) || ETF_EXCLUDE.has(base) || INDEX_EXCLUDE.has(base)) continue;
+    
+    // Use base_increment as minimum order quantity
+    map[base] = parseFloat(inc);
+  }
+  
+  return map;
 }
 
 module.exports = {
@@ -187,4 +240,8 @@ module.exports = {
   loadCredentials,
   request,
   toBrokeragePath,
+  PERP_EXCLUDE,
+  ETF_EXCLUDE,
+  INDEX_EXCLUDE,
+  buildMinOrderQtyMap,
 };

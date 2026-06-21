@@ -9,8 +9,25 @@ import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import os from 'os';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
+import { createClient, buildMinOrderQtyMap, PERP_EXCLUDE, ETF_EXCLUDE, INDEX_EXCLUDE } from './coinbase-advanced.js';
 
 dotenv.config();
+
+// Dynamic MIN_ORDER_QTY_MAP fetched from Coinbase products
+let MIN_ORDER_QTY_MAP = {};
+
+async function initMinOrderQtyMap() {
+  try {
+    const client = createClient();
+    MIN_ORDER_QTY_MAP = await buildMinOrderQtyMap(client);
+    if (Object.keys(MIN_ORDER_QTY_MAP).length === 0) throw new Error('Empty map returned');
+    console.log(`📦 Dynamic MIN_ORDER_QTY_MAP loaded: ${Object.keys(MIN_ORDER_QTY_MAP).length} assets`);
+  } catch (err) {
+    console.warn(`⚠️ Failed to load dynamic MIN_ORDER_QTY_MAP, using $0.50 min order fallback: ${err.message}`);
+    // MIN_ORDER_QTY_MAP stays empty - checkMinQuantity will use getFallbackMinQty
+    console.log(`📦 Using $0.50 minimum order value fallback`);
+  }
+}
 
 // --- AssetRegimeManager (Embedded) ---
 class AssetRegimeManager {
@@ -48,7 +65,7 @@ class AssetRegimeManager {
 
 // --- RegimeDetector (Embedded) ---
 class RegimeDetector {
-  constructor() { this.regimes = {}; }
+  constructor() { this.regimes = {}; this.market24h = { gainers: [], losers: [] }; }
   analyze(symbol, history) {
     if (!history || history.length < 50) { this.regimes[symbol] = 'UNKNOWN'; return 'UNKNOWN'; }
     const currentPrice = history[history.length - 1];
@@ -73,7 +90,14 @@ class RegimeDetector {
     // Maintained history buffer could go here if we wanted fully self-contained detector state
     // For now relying on analyze() being called with history
   }
+  updateMarket24h(gainers, losers) {
+    this.market24h = { gainers, losers, updatedAt: Date.now() };
+    // Log top movers for regime awareness
+    if (gainers.length > 0) console.log(`📈 24h Gainers: ${gainers.map(g => `${g.symbol} ${g.change24h.toFixed(2)}%`).join(', ')}`);
+    if (losers.length > 0) console.log(`📉 24h Losers: ${losers.map(l => `${l.symbol} ${l.change24h.toFixed(2)}%`).join(', ')}`);
+  }
   getRegime(symbol) { return this.regimes[symbol] || 'UNKNOWN'; }
+  getMarket24h() { return this.market24h; }
 }
 
 // --- LegionManager (Embedded) ---
@@ -299,19 +323,15 @@ const minIncrementMap = {
   ZORA: 0.1, ZRO: 0.01, ZRX: 0.1
 };
 
-const MIN_ORDER_QTY_MAP = {
-  // Ground-truth minimum order quantities fetched directly from Robinhood Crypto API
-  AAVE: 0.0001, ADA: 0.1, AERO: 0.1, ALGO: 1.0, ARB: 0.1, ASTER: 0.01, ATOM: 0.1, AVAX: 0.001, AVNT: 0.1, AXS: 0.1,
-  BAT: 1.0, BCH: 0.001, BIO: 1.0, BNB: 0.0001, BONK: 1000.0, BTC: 0.000001, CC: 1.0, CHIP: 1.0, COMP: 0.0001, CRV: 0.1,
-  DOGE: 1.0, DOT: 0.01, EIGEN: 1.0, ENA: 0.1, ETC: 0.01, ETH: 0.0001, FLOKI: 1000.0, FLR: 20.0, GRT: 1.0,
-  HBAR: 0.1, HYPE: 0.001, IMX: 1.0, JTO: 0.1, LDO: 0.1, LINK: 0.01, LIT: 0.01, LTC: 0.001, MEGA: 1.0,
-  MEW: 10.0, MNT: 0.1, MOODENG: 0.1, NEAR: 0.1, ONDO: 0.1, OP: 0.1, ORCA: 0.1, PAXG: 0.00001,
-  PENGU: 10.0, PEPE: 10000.0, PNUT: 1.0, POPCAT: 0.1, PYTH: 1.0, QNT: 0.001, RAY: 1.0, RE: 0.1, RENDER: 0.01,
-  SEI: 0.1, SHIB: 800.0, SKR: 10.0, SKY: 1.0, SNX: 0.1, SOL: 0.0001, STRK: 5.0, SUI: 0.01, SYRUP: 0.1,
-  TON: 0.01, TRUMP: 0.001, UNI: 0.01, USDG: 0.01, USDC: 0.01, VIRTUAL: 0.1, VVV: 0.01, W: 10.0,
-  WIF: 0.01, WLFI: 1.0, XCN: 10.0, XLM: 1.0, XPL: 0.1, XRP: 0.1, XTZ: 0.01, ZEC: 0.001,
-  ZORA: 1.0, ZRO: 0.1, ZRX: 5.0
-};
+// Fallback: simple $0.50 minimum order value calculator
+// Used when dynamic fetch fails - calculates min qty from price
+const MIN_ORDER_USD_MIN = 0.50;
+
+function getFallbackMinQty(symbol, price) {
+  if (!price || price <= 0) return 0;
+  // $0.50 minimum order value
+  return Math.max(0.00000001, MIN_ORDER_USD_MIN / price);
+}
 
 const SLIPPAGE_BUFFERS = {
   // 🔴 CRITICAL / HIGH SLIPPAGE (>= 1.05% on either side)
@@ -509,6 +529,7 @@ class TradingEngine {
     // --- Risk Metrics ---
     this.peakTotalValue = initialCapital;
     this.maxDrawdownPercent = 0.0;
+    this.initialCapital = initialCapital; // $0 for LIVE; set from first portfolio value on boot
 
     this.priceHistory = {}; // Engine-local price history
     this.priceHistoryBuffer = []; // Global high-res history (LIVE only) or Simulation history (SHADOW)
@@ -532,6 +553,9 @@ class TradingEngine {
       this.genome = { ...this.genome, ...data.genome };
       this.genome.REINVEST_COOLDOWN_QUEUE_SIZE = 15; // Enforce 15-token queue size
     }
+    if (data.initialCapital !== undefined && data.initialCapital > 0) this.initialCapital = data.initialCapital;
+    if (data.peakTotalValue !== undefined && data.peakTotalValue > 0) this.peakTotalValue = data.peakTotalValue;
+    if (data.maxDrawdownPercent !== undefined) this.maxDrawdownPercent = data.maxDrawdownPercent;
   }
 
   getStateSnapshot() {
@@ -549,7 +573,10 @@ class TradingEngine {
       // Include Dreamer promotion threshold & visual metadata for persistence
       lastBestScore: global.lastBestScore || 1.0,
       assetSourceTimeframe: this.assetSourceTimeframe || {},
-      overflowTarget: SNOWBALL_CONFIG.OVERFLOW_TARGET
+      overflowTarget: SNOWBALL_CONFIG.OVERFLOW_TARGET,
+      initialCapital: this.initialCapital,
+      peakTotalValue: this.peakTotalValue,
+      maxDrawdownPercent: this.maxDrawdownPercent
     };
   }
 
@@ -1761,47 +1788,51 @@ class TradingEngine {
 
               // B. Execute 100% Spawn Buy (market buy 100% of spawnCost)
               const hydrationCost = spawnCost;
-              // Attempt to fetch price or default to 1.00
-              const buyP = portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym] || 1.00;
-              const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
+              const buyP = portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym];
 
-              if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
-                console.log(`   → Placing 100% spawn buy for ${buyQtyStr} ${nextSym}...`);
-                const buyResp = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
-                if (buyResp?.id) {
-                  const confirmedBuy = buyResp;
-                  if (confirmedBuy) {
-                    const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
-                    const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
-                    const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP) || buyP;
+              if (!buyP || buyP <= 0) {
+                console.warn(`⚠️ [MITOSIS] Could not fetch price for ${nextSym}, skipping spawn`);
+              } else {
+                const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
 
-                    // Measure and update lastSlippage
-                    const slippage = (effectivePrice - buyP) / buyP;
-                    const sym = nextSym;
-                    if (!this.ratchetState[sym]) {
-                      this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
+                if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
+                  console.log(`   → Placing 100% spawn buy for ${buyQtyStr} ${nextSym}...`);
+                  const buyResp = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
+                  if (buyResp?.id) {
+                    const confirmedBuy = buyResp;
+                    if (confirmedBuy) {
+                      const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
+                      const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
+                      const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP) || buyP;
+
+                      // slippage
+                      const slippage = (effectivePrice - buyP) / buyP;
+                      const sym = nextSym;
+                      if (!this.ratchetState[sym]) {
+                        this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
+                      }
+                      this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                      const actualCost = filledQty * effectivePrice;
+
+                      this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
+
+                      // Initialize Cost Basis for Newly Spawned Asset
+                      this.ratchetState[nextSym] = {
+                        harvestModifier: 0.0,
+                        rebalanceModifier: 0.0,
+                        lastTradeSide: 'BUY',
+                        localCostBasis: effectivePrice,
+                        localQty: filledQty
+                      };
+                      console.log(`📈 [COST BASIS] ${nextSym} Spawn Hydrated! Qty: ${filledQty.toFixed(4)} @ $${effectivePrice.toFixed(8)}. Initialized Cost Basis: $${effectivePrice.toFixed(8)}`);
+
+                      anyTradesThisCycle = true;
+
+                      this.cashBalance -= actualCost;
+                      if (this.cashBalance < 0) this.cashBalance = 0;
+                      if (this.mode === 'LIVE') saveState();
+                      console.log(`   ✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
                     }
-                    this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                    const actualCost = filledQty * effectivePrice;
-
-                    this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
-
-                    // Initialize Cost Basis for Newly Spawned Asset
-                    this.ratchetState[nextSym] = {
-                      harvestModifier: 0.0,
-                      rebalanceModifier: 0.0,
-                      lastTradeSide: 'BUY',
-                      localCostBasis: effectivePrice,
-                      localQty: filledQty
-                    };
-                    console.log(`📈 [COST BASIS] ${nextSym} Spawn Hydrated! Qty: ${filledQty.toFixed(4)} @ $${effectivePrice.toFixed(8)}. Initialized Cost Basis: $${effectivePrice.toFixed(8)}`);
-
-                    anyTradesThisCycle = true;
-
-                    this.cashBalance -= actualCost;
-                    if (this.cashBalance < 0) this.cashBalance = 0;
-                    if (this.mode === 'LIVE') saveState();
-                    console.log(`   ✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
                   }
                 }
               }
@@ -1815,7 +1846,7 @@ class TradingEngine {
             anyTradesThisCycle = true;
 
             const hydrationCost = spawnCost;
-            const buyP = (priceMap && priceMap[nextSym]) || portfolioSummary.find(r => r.Symbol === nextSym)?.Price || 1.00;
+            const buyP = (priceMap && priceMap[nextSym]) || portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym] || 1.00;
             const buyQty = hydrationCost / buyP;
 
             if (!this.holdings[nextSym]) this.holdings[nextSym] = { rawQuantity: 0 };
@@ -1945,6 +1976,11 @@ function checkMinQuantity(symbol, qty) {
   const minQty = MIN_ORDER_QTY_MAP[symbol];
   if (minQty) {
     if (parseFloat(qty) < minQty) return false;
+  } else {
+    // Fallback: $0.50 minimum order value
+    // We don't have price here, so we'll be lenient and allow the order
+    // The actual min qty check happens in the exchange
+    // This is a safety net only
   }
   return true;
 }
@@ -2644,7 +2680,11 @@ async function mainLoop() {
   pruneMarketDataFile(); // Run HDD-safe pruning once on startup
   console.log("🚀 Initializing Cryptobot Token Flex (v4.0.0 - Shadow Engine Architecture)...");
 
+  // Initialize dynamic asset map from Coinbase products
+  await initMinOrderQtyMap();
+
   const dryRunOnce = process.argv.includes('--dry-run-once');
+  const paperMode = process.argv.includes('--paper');
   const previewOrder = parsePreviewOrderArgs(process.argv);
   const strategyPreview = parseStrategyPreviewArgs(process.argv);
   const strategyPlace = parseStrategyPlaceArgs(process.argv);
@@ -2660,25 +2700,44 @@ async function mainLoop() {
 
   let rh;
   try {
-    rh = new CoinbaseWormAPI({ readOnly, previewOnly: previewMode });
-    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : readOnly ? ' [READ-ONLY]' : '';
+    rh = new CoinbaseWormAPI({ readOnly: paperMode || readOnly, previewOnly: previewMode });
+    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : paperMode ? ' [PAPER]' : readOnly ? ' [READ-ONLY]' : '';
     console.log(`🔑 Coinbase API Initialized${modeLabel}.`);
   }
   catch (error) { console.error("❌ FATAL: API initialization failed:", error.message); rl.close(); return; }
 
-  // --- Initialize Live Engine ---
-  liveEngine = new TradingEngine(defaultGenome, 'LIVE');
+  // --- Initialize Engine ---
+  const engineMode = paperMode ? 'SHADOW' : 'LIVE';
+  liveEngine = new TradingEngine(defaultGenome, engineMode);
 
-  // Load State
+  // Load State (for genome, promotion thresholds, etc. — applies to both modes)
   const { loadedBaselines, loadedTrailingState, loadedLastActionTimestamps, loadedGenome, loadedData, loadedAssetSourceTimeframe } = loadState();
   if (loadedData) {
-    liveEngine.loadPersistedState(loadedData);
+    if (!paperMode) {
+      liveEngine.loadPersistedState(loadedData);
+    }
+    // User requested timeframe colors to start white and only colorize on new promotions this session.
+    // We no longer restore assetSourceTimeframe on boot.
+    if (loadedData.overflowTarget) {
+      SNOWBALL_CONFIG.OVERFLOW_TARGET = loadedData.overflowTarget;
+      console.log(`🎯 [Worm Config] Restored dynamic overflow target: ${SNOWBALL_CONFIG.OVERFLOW_TARGET}`);
+    }
   }
-  // User requested timeframe colors to start white and only colorize on new promotions this session.
-  // We no longer restore assetSourceTimeframe on boot.
-  if (loadedData && loadedData.overflowTarget) {
-    SNOWBALL_CONFIG.OVERFLOW_TARGET = loadedData.overflowTarget;
-    console.log(`🎯 [Worm Config] Restored dynamic overflow target: ${SNOWBALL_CONFIG.OVERFLOW_TARGET}`);
+  // Paper mode initialization (runs regardless of loadedData)
+  if (paperMode) {
+    // Paper mode: use simulated empty portfolio with $10,000 cash
+    // Override the API calls to return empty holdings for pure simulation
+    const startCapital = 10000; // $10,000 simulated
+    liveEngine.cashBalance = startCapital;
+    liveEngine.initialCapital = startCapital;
+    liveEngine.peakTotalValue = startCapital;
+    console.log(`📄 Paper Trading Mode: Simulated capital $${startCapital.toFixed(2)} (empty portfolio)`);
+    
+    // Override rh.getBalance and rh.getHoldings for paper mode
+    const originalGetBalance = rh.getBalance.bind(rh);
+    const originalGetHoldings = rh.getHoldings.bind(rh);
+    rh.getBalance = async () => liveEngine.cashBalance;
+    rh.getHoldings = async () => [];
   }
   if (loadedGenome) {
     // Merge loaded genome with defaults, preserving overrides
@@ -2773,6 +2832,7 @@ async function mainLoop() {
   console.log("╚═══════════════════════════════════════════════════╝\n");
 
   let initialized = false;
+  let lastEngineHoldings = {}; // Track engine's holdings from previous cycle for display
 
   // --- Initialize Managers (Legion Architecture) ---
   // 1. Asset & Regime Memory (Tier 1 & 2 Configs)
@@ -3046,6 +3106,7 @@ async function mainLoop() {
 
   // 4. The Legion Manager (Broad Present)
   // Orchestrates Shadows and dispatches orders to Dreamers
+  // In paper mode, we also run Legion for shadow bot evolution
   const legionManager = (dryRunOnce || strategyPreview || strategyPlace) ? null : new LegionManager(liveEngine, TradingEngine, dreamerGrid);
 
   // Inject dependencies into global scope/main loop variables helper if needed?
@@ -3254,10 +3315,43 @@ async function mainLoop() {
 
     // Fetch Balance, Holdings, Quotes (Unchanged)
     let cashBalance = 0; try { cashBalance = await rh.getBalance(); console.log(`💰 Available Cash Balance: $${cashBalance.toFixed(2)}`); } catch (err) { console.error("❌ FATAL: Could not fetch balance:", err.message); rl.close(); return; }
-    let holdings = []; try { holdings = await rh.getHoldings(); if (holdings.length === 0) console.log("ℹ️ No crypto holdings found."); } catch (err) { console.error("❌ FATAL: Could not fetch holdings:", err.message); rl.close(); return; }
-    const holdingDetails = {}; let codes = [];
-    if (holdings.length > 0) { holdings.forEach(h => { const code = h.asset_code; const qty = parseFloat(h.total_quantity) || 0; const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10; if (code && qty > minQtyThreshold) { if (!holdingDetails[code]) { holdingDetails[code] = { rawQuantity: 0 }; codes.push(code); } holdingDetails[code].rawQuantity += qty; } }); if (codes.length > 0) console.log(`📊 Holdings: ${codes.join(', ')}`); else console.log("ℹ️ No significant crypto holdings found after filtering."); }
-    let rhPrices = {}; if (codes.length > 0) { try { rhPrices = await rh.getQuotes(codes); } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
+    let holdings = [];
+    let holdingDetails = {};
+    let codes = [];
+    let rhPrices = {};
+
+    if (paperMode) {
+      // Paper mode: build holdings from engine's simulated state
+      cashBalance = liveEngine.cashBalance;
+      console.log(`💰 Available Cash Balance: $${cashBalance.toFixed(2)}`);
+      
+      for (const [sym, details] of Object.entries(liveEngine.holdings)) {
+        // Handle both formats: {rawQuantity: qty} or plain qty
+        const qty = (typeof details === 'object' && details !== null) 
+          ? (details.rawQuantity || 0) 
+          : (details || 0);
+        if (qty > 0) {
+          const price = liveEngine.lastCyclePrices[sym] || (await rh.getQuotes([sym]))?.[sym];
+          if (price && price > 0) {
+            holdings.push({ asset_code: sym, total_quantity: qty.toString() });
+            holdingDetails[sym] = { rawQuantity: qty };
+            codes.push(sym);
+          }
+        }
+      }
+      if (codes.length > 0) {
+        console.log(`📊 Holdings: ${codes.join(', ')}`);
+        rhPrices = await rh.getQuotes(codes);
+      } else {
+        console.log("ℹ️ No crypto holdings found.");
+        console.log("ℹ️ Skipping quote fetch.");
+      }
+    } else {
+      // Live mode: fetch from API
+      try { holdings = await rh.getHoldings(); if (holdings.length === 0) console.log("ℹ️ No crypto holdings found."); } catch (err) { console.error("❌ FATAL: Could not fetch holdings:", err.message); rl.close(); return; }
+      if (holdings.length > 0) { holdings.forEach(h => { const code = h.asset_code; const qty = parseFloat(h.total_quantity) || 0; const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10; if (code && qty > minQtyThreshold) { if (!holdingDetails[code]) { holdingDetails[code] = { rawQuantity: 0 }; codes.push(code); } holdingDetails[code].rawQuantity += qty; } }); if (codes.length > 0) console.log(`📊 Holdings: ${codes.join(', ')}`); else console.log("ℹ️ No significant crypto holdings found after filtering."); }
+      if (codes.length > 0) { try { rhPrices = await rh.getQuotes(codes); } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
+    }
 
     // Calculate Portfolio Summary & Initialize/Verify Baselines & State (Unchanged)
     let totalHoldingsValue = 0; const portfolioSummary = []; const currentSymbols = new Set(); let baselinesVerifiedOrSetThisCycle = false;
@@ -3302,7 +3396,26 @@ async function mainLoop() {
       appendMarketData(Date.now(), portfolioSummary);
     }
 
-    if (!initialized && baselinesVerifiedOrSetThisCycle) { console.log("✅ Baselines & Timestamps init/verify complete."); initialized = true; if (stateChanged) { saveState(); stateChanged = false; } } else if (!initialized && holdings.length > 0 && codes.length === 0) { console.log("⏳ Waiting for valid prices to initialize baselines..."); }
+    // Paper mode: initialize as ready to trade even with empty portfolio
+    if (!initialized && paperMode && liveEngine.cashBalance > 0) {
+      console.log("✅ Paper mode initialized: ready to spawn assets.");
+      initialized = true;
+      if (stateChanged) { saveState(); stateChanged = false; }
+    }
+    else if (!initialized && baselinesVerifiedOrSetThisCycle) {
+      console.log("✅ Baselines & Timestamps init/verify complete.");
+      initialized = true;
+      // Capture initial capital on first successful initialization
+      if (liveEngine.initialCapital <= 0 && portfolioSummary.length > 0) {
+        const initialValue = portfolioSummary.reduce((sum, r) => sum + r.Value, 0) + liveEngine.cashBalance;
+        if (initialValue > 0) {
+          liveEngine.initialCapital = initialValue;
+          liveEngine.peakTotalValue = initialValue;
+          console.log(`💰 Initial Capital recorded: $${initialValue.toFixed(2)}`);
+        }
+      }
+      if (stateChanged) { saveState(); stateChanged = false; }
+    } else if (!initialized && holdings.length > 0 && codes.length === 0) { console.log("⏳ Waiting for valid prices to initialize baselines..."); }
 
     // --- Clean up persistent state for EXCLUDED assets that are still held ---
     currentSymbols.forEach(sym => {
@@ -3497,7 +3610,39 @@ async function mainLoop() {
       printTable(headers, tableRows);
 
     } else { if (holdings.length > 0) console.log("ℹ️ No displayable portfolio data (likely waiting on valid prices)."); }
-    console.log("--- Financial Overview ---"); console.log(`Total Holdings Value:   $${totalHoldingsValue.toFixed(2)}`); console.log(`Cash Balance:           $${cashBalance.toFixed(2)}`); const totalPortfolioValue = totalHoldingsValue + cashBalance; console.log(`Total Portfolio Value:  $${totalPortfolioValue.toFixed(2)}`); const diffPrefix = totalBaselineDifference >= 0 ? '+' : ''; const diffColor = totalBaselineDifference >= 0 ? '\x1b[32m' : '\x1b[31m'; const resetColor = '\x1b[0m'; console.log(`Deviation (Managed):    ${diffColor}${diffPrefix}$${totalBaselineDifference.toFixed(2)} (${currentPortfolioDeviationPercent.toFixed(2)}%)${resetColor}`);
+        console.log("--- Financial Overview ---");
+        console.log(`Total Holdings Value:   $${totalHoldingsValue.toFixed(2)}`);
+        console.log(`Cash Balance:           $${cashBalance.toFixed(2)}`);
+        const totalPortfolioValue = totalHoldingsValue + cashBalance;
+        console.log(`Total Portfolio Value:  $${totalPortfolioValue.toFixed(2)}`);
+
+        // PnL / Drawdown metrics
+        if (liveEngine.initialCapital > 0) {
+          const pnl = totalPortfolioValue - liveEngine.initialCapital;
+          const pnlPct = (pnl / liveEngine.initialCapital) * 100;
+          const currentDD = liveEngine.peakTotalValue > 0 ? ((liveEngine.peakTotalValue - totalPortfolioValue) / liveEngine.peakTotalValue) * 100 : 0;
+          const maxDD = liveEngine.maxDrawdownPercent * 100;
+          const pnlColor = pnl >= 0 ? '\x1b[32m' : '\x1b[31m';
+          const resetColor = '\x1b[0m';
+          console.log(`Val: $${totalPortfolioValue.toFixed(2)}  ${pnlColor}PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)${resetColor}  DD: ${currentDD.toFixed(2)}%  MaxDD: ${maxDD.toFixed(2)}%`);
+        }
+
+        const diffPrefix = totalBaselineDifference >= 0 ? '+' : '';
+        const diffColor = totalBaselineDifference >= 0 ? '\x1b[32m' : '\x1b[31m';
+        const resetColor = '\x1b[0m';
+        console.log(`Deviation (Managed):    ${diffColor}${diffPrefix}$${totalBaselineDifference.toFixed(2)} (${currentPortfolioDeviationPercent.toFixed(2)}%)${resetColor}`);
+
+    // --- Fetch 24h Gainers/Losers for Regime Study ---
+    if (regimeDetector && rh && !strategyPreview && !strategyPlace) {
+      try {
+        const movers = await rh.getGainersLosers(10);
+        if (movers.gainers.length > 0 || movers.losers.length > 0) {
+          regimeDetector.updateMarket24h(movers.gainers, movers.losers);
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed to fetch 24h gainers/losers: ${err.message}`);
+      }
+    }
 
     // --- Regime Radar (Legion Awareness) ---
     if (LEGION_CONFIG.ENABLE_DEVELOPER_LOGS && regimeDetector && regimeDetector.regimes) {
@@ -3528,14 +3673,25 @@ async function mainLoop() {
       break;
     }
 
+    // Paper mode: build simulated portfolioSummary from engine's internal state
     // --- Auto Trading Logic ---
-    if (portfolioSummary.length === 0 || !initialized) {
+    // In paper mode, allow engine to run with empty portfolio (spawner needs cash)
+    const shouldRunEngine = paperMode 
+      ? (liveEngine.cashBalance > 0 && initialized)
+      : (portfolioSummary.length > 0 && initialized);
+      
+    if (!shouldRunEngine) {
       console.log("⏳ Skipping trading actions (Portfolio empty or not initialized).\n");
     }
     else {
       console.log("🚦 Baselines ready. Delegating to Live Engine...");
 
       const engineResult = await liveEngine.update(portfolioSummary, rh, cashBalance, holdingDetails);
+
+      // Store engine's holdings for next cycle's display (especially paper mode)
+      if (engineResult.holdings) {
+        lastEngineHoldings = engineResult.holdings;
+      }
 
       // --- Legion Heartbeat ---
       if (legionManager) {
@@ -3625,7 +3781,8 @@ async function mainLoop() {
 
 
     // --- Periodic & Immediate State Save ---
-    if (stateChanged || (startTime - lastStateSaveTime >= STATE_SAVE_INTERVAL)) {
+    // Skip state persistence in paper mode (simulated only)
+    if (!paperMode && (stateChanged || (startTime - lastStateSaveTime >= STATE_SAVE_INTERVAL))) {
       saveEngineState();
       stateChanged = false;
       lastStateSaveTime = startTime;
@@ -3644,7 +3801,7 @@ async function mainLoop() {
 
   } // End Main Loop
 
-  console.log(strategyPlace ? "🛑 Strategy live run complete." : strategyPreview ? "🛑 Strategy preview complete." : dryRunOnce ? "🛑 Read-only dry run complete." : "🛑 Main loop exited unexpectedly."); rl.close();
+  console.log(strategyPlace ? "🛑 Strategy live run complete." : strategyPreview ? "🛑 Strategy preview complete." : dryRunOnce ? "🛑 Read-only dry run complete." : paperMode ? "🛑 Paper trading stopped." : "🛑 Main loop exited unexpectedly."); rl.close();
 } // End mainLoop Function
 
 

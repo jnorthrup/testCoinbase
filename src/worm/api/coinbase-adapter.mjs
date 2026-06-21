@@ -80,6 +80,29 @@ class CoinbaseWormAPI {
     return out;
   }
 
+  async getGainersLosers(limit = 10) {
+    const resp = await this.client.request({ method: 'GET', requestPath: 'products' });
+    const products = resp?.body?.products || [];
+    
+    const usd = products
+      .filter(p => p.status === 'online' && p.product_id?.endsWith('-USD'))
+      .map(p => ({
+        symbol: p.product_id.split('-')[0],
+        change24h: parseFloat(p.price_percentage_change_24h || '0'),
+        volume24h: parseFloat(p.volume_24h || '0'),
+        price: parseFloat(p.price || '0'),
+      }))
+      .filter(p => p.change24h !== 0 && p.volume24h > 0);
+    
+    usd.sort((a, b) => b.change24h - a.change24h);
+    
+    return {
+      gainers: usd.slice(0, limit),
+      losers: usd.slice(-limit).reverse(),
+      all: usd,
+    };
+  }
+
   async getOrderStatus(orderId) {
     const body = await this.client.getOrder(orderId);
     const order = body?.order || body;
