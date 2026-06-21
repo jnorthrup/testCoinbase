@@ -1,7 +1,7 @@
 // Cryptobot Token Flex (ESM style) - v4.0.0 "Hyper-Evolutionary" - All Parameters Evolvable
 
 import dotenv from "dotenv";
-import crypto from "crypto"; // for crypto.randomUUID()
+import crypto from "crypto";
 import readline from "readline";
 import fs from 'fs';
 import path from "path";
@@ -10,6 +10,26 @@ import { fork } from 'child_process';
 import os from 'os';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
 import { createClient, buildMinOrderQtyMap, PERP_EXCLUDE, ETF_EXCLUDE, INDEX_EXCLUDE } from './coinbase-advanced.js';
+import {
+  minIncrementMap,
+  SLIPPAGE_BUFFERS,
+  HARVEST_EXCLUDE,
+  REBALANCE_EXCLUDE,
+  PRECISION_THRESHOLD,
+  SNOWBALL_CONFIG,
+  defaultGenome,
+  getFallbackMinQty,
+} from './src/worm/config/constants.mjs';
+import { roundQty, checkMinQuantity, setMinOrderQtyMap } from './src/worm/utils/quantity.mjs';
+import {
+  getEffectivePriceFromResp,
+  getFilledQuantityFromResp,
+  getSettledValueFromResp,
+  getTotalFeesFromResp,
+  getGrossValueFromResp,
+  parseOptionalNumber,
+  getGenomicParam,
+} from './src/worm/utils/helpers.mjs';
 
 dotenv.config();
 
@@ -19,12 +39,12 @@ let MIN_ORDER_QTY_MAP = {};
 async function initMinOrderQtyMap() {
   try {
     const client = createClient();
-    MIN_ORDER_QTY_MAP = await buildMinOrderQtyMap(client);
-    if (Object.keys(MIN_ORDER_QTY_MAP).length === 0) throw new Error('Empty map returned');
-    console.log(`📦 Dynamic MIN_ORDER_QTY_MAP loaded: ${Object.keys(MIN_ORDER_QTY_MAP).length} assets`);
+    const map = await buildMinOrderQtyMap(client);
+    if (Object.keys(map).length === 0) throw new Error('Empty map returned');
+    setMinOrderQtyMap(map);
+    console.log(`📦 Dynamic MIN_ORDER_QTY_MAP loaded: ${Object.keys(map).length} assets`);
   } catch (err) {
     console.warn(`⚠️ Failed to load dynamic MIN_ORDER_QTY_MAP, using $0.50 min order fallback: ${err.message}`);
-    // MIN_ORDER_QTY_MAP stays empty - checkMinQuantity will use getFallbackMinQty
     console.log(`📦 Using $0.50 minimum order value fallback`);
   }
 }
@@ -309,142 +329,16 @@ const LEGION_CONFIG = {
 // ============== Config/Maps and Constants ==============
 
 // --- Asset Specific ---
-const minIncrementMap = {
-  // Ground-truth precision increments fetched directly from Robinhood Crypto API
-  AAVE: 0.00001, ADA: 0.01, AERO: 0.01, ALGO: 0.1, ARB: 0.01, ASTER: 0.001, ATOM: 0.01, AVAX: 0.0001, AVNT: 0.01, AXS: 0.01,
-  BAT: 0.1, BCH: 0.00000001, BIO: 0.1, BNB: 0.00001, BONK: 1.0, BTC: 0.00000001, CC: 0.001, CHIP: 0.1, COMP: 0.00001, CRV: 0.01,
-  DOGE: 0.01, DOT: 0.001, EIGEN: 0.001, ENA: 0.01, ETC: 0.000001, ETH: 0.000001, FLOKI: 1.0, FLR: 1.0, GRT: 0.1,
-  HBAR: 0.01, HYPE: 0.0001, IMX: 0.1, JTO: 0.01, LDO: 0.01, LINK: 0.0001, LIT: 0.001, LTC: 0.00000001, MEGA: 0.1,
-  MEW: 1.0, MNT: 0.01, MOODENG: 0.01, NEAR: 0.01, ONDO: 0.01, OP: 0.01, ORCA: 0.01, PAXG: 0.000001,
-  PENGU: 1.0, PEPE: 1.0, PNUT: 0.1, POPCAT: 0.01, PYTH: 0.1, QNT: 0.0001, RAY: 0.1, RE: 0.01, RENDER: 0.001,
-  SEI: 0.01, SHIB: 1.0, SKR: 0.1, SKY: 0.1, SNX: 0.01, SOL: 0.00001, STRK: 0.1, SUI: 0.001, SYRUP: 0.01,
-  TON: 0.001, TRUMP: 0.0001, UNI: 0.0001, USDG: 0.01, USDC: 0.01, VIRTUAL: 0.01, VVV: 0.001, W: 1.0,
-  WIF: 0.0001, WLFI: 0.1, XCN: 1.0, XLM: 0.01, XPL: 0.01, XRP: 0.001, XTZ: 0.001, ZEC: 0.00001,
-  ZORA: 0.1, ZRO: 0.01, ZRX: 0.1
-};
-
-// Fallback: simple $0.50 minimum order value calculator
-// Used when dynamic fetch fails - calculates min qty from price
-const MIN_ORDER_USD_MIN = 0.50;
-
-function getFallbackMinQty(symbol, price) {
-  if (!price || price <= 0) return 0;
-  // $0.50 minimum order value
-  return Math.max(0.00000001, MIN_ORDER_USD_MIN / price);
-}
-
-const SLIPPAGE_BUFFERS = {
-  // 🔴 CRITICAL / HIGH SLIPPAGE (>= 1.05% on either side)
-  ZEC: { buy: 0.0108, sell: 0.0157 },
-  XCN: { buy: 0.0113, sell: 0.0112 },
-  VIRTUAL: { buy: 0.0113, sell: 0.0109 },
-  XLM: { buy: 0.0099, sell: 0.0119 },
-  RE: { buy: 0.0113, sell: 0.0113 },
-  LIT: { buy: 0.0100, sell: 0.0105 },
-  DOGE: { buy: 0.0104, sell: 0.0111 },
-  ADA: { buy: 0.0101, sell: 0.0110 },
-
-  // 🟢 DEFAULT FALLBACK (maps closely to 0.97% buy / 1.00% sell average)
-  DEFAULT: { buy: 0.0097, sell: 0.0100 }
-};
+// (minIncrementMap and SLIPPAGE_BUFFERS imported from ./src/worm/config/constants.mjs)
 
 // Exclude BTC/ETH/USDC/USDG from automatic actions
-const HARVEST_EXCLUDE = ["BTC", "ETH", "USDC", "USDG"];  // Applies to both individual and portfolio harvest participation
-const REBALANCE_EXCLUDE = ["BTC", "ETH", "USDC", "USDG"]; // Also excludes from Priority Reinvestment & Adaptive Mode
-const PRECISION_THRESHOLD = 0.0001; // Threshold for detecting deviation improvements
+// (HARVEST_EXCLUDE, REBALANCE_EXCLUDE, PRECISION_THRESHOLD imported from constants.mjs)
 
 // --- Hybrid Stablecoin Snowball Bank & Spawner Config ---
-const SNOWBALL_CONFIG = {
-  USDC_THRESHOLD_USD: 10.00,  // Standard compounding trigger threshold (Unused/Replaced by Cash Bank)
-  CRITICAL_MASS_USD: 100.00,  // Target size for altcoins to graduate
-  MIN_SPAWN_COST_USD: 30.00,  // Fixed fast spawn target baseline ($30.00)
-  HARVEST_TAX_BTC_PCT: 0.00,  // 0% to BTC during incubation
-  HARVEST_TAX_USDC_PCT: 0.00, // 0% to USDC during incubation (Upgraded to 100% Cash Bank / Crash Fund + Surplus)
-  OVERFLOW_TARGET: process.env.OVERFLOW_TARGET || "ETH"       // Default target for compounding once all are spawned and graduated
-};
+// (SNOWBALL_CONFIG imported from constants.mjs)
 
 // --- Genome Definition (Hyper-Evolutionary Core) ---
-const defaultGenome = {
-  // --- Core Strategy ---
-  TARGET_ADJUST_PERCENT: 0.001, // 0.1% - Careful ratchet to acknowledge the win without choking cash flow
-  ALLOW_MUTATION: true, // Master switch for Evolution Manager
-
-  // --- Individual Asset Harvest (Standard) ---
-  FLAT_HARVEST_TRIGGER_PERCENT: 0.035,
-  HARVEST_TAKE_PERCENT: 0.90, // Geometric Growth: 70% to cash, 30% left to compound
-  HARVEST_CYCLE_THRESHOLD: 3,
-  MIN_SURPLUS_FOR_HARVEST: 0.25,
-  MIN_SURPLUS_FOR_FORCED_HARVEST: 1.00,
-  FORCED_HARVEST_TIMEOUT: 45 * 60 * 1000, // Increased from 20 mins to 45 mins to give more breathing room before forcing.
-
-  // --- Portfolio Override Harvest ---
-  ENABLE_PORTFOLIO_HARVEST: true,
-  PORTFOLIO_HARVEST_TRIGGER_DEVIATION_PERCENT: 0.035,
-  PORTFOLIO_HARVEST_CONFIRMATION_CYCLES: 3,
-  MIN_ASSET_SURPLUS_FOR_PORTFOLIO_HARVEST: 0.10,
-
-  // --- Harvest Proceeds Allocation ---
-  HARVEST_ALLOC_BTC_PERCENT: 0.20,
-  HARVEST_ALLOC_ETH_PERCENT: 0.20,
-  HARVEST_ALLOC_REINVEST_PERCENT: 0.20,
-  HARVEST_ALLOC_CASH_PERCENT: 0.40, // Implicit, but kept for genome completeness
-
-  // --- Crash Fund (Liquidity Reserve) ---
-  CRASH_FUND_THRESHOLD_PERCENT: 0.05, // Require 10% cash reserve before normal allocation
-
-  MIN_HARVEST_TO_ALLOCATE: 0.25,
-  MIN_NEGATIVE_DEVIATION_FOR_REINVEST: -0.010,
-  MIN_REINVEST_BUY_USD: 0.25,
-  REINVEST_BASELINE_GROWTH_FACTOR: 0.50, // 0.85 = The Sweet Spot (Recover some, grow a lot)
-  REINVEST_COOLDOWN_QUEUE_SIZE: 15,
-
-  MIN_BTC_BUY_USD: 0.10,
-  MIN_ETH_BUY_USD: 0.25,
-
-  // --- Rebalance (Standard) ---
-  FLAT_REBALANCE_TRIGGER_PERCENT: 0.035,
-  PARTIAL_RECOVERY_PERCENT: 0.70,
-  REBALANCE_POSITIVE_THRESHOLD: 5,
-  MAX_REBALANCE_ATTEMPTS: 3, // Now Evolvable (Risk Gene)
-  REBALANCE_COOLDOWN: 30 * 60 * 1000, // Now Evolvable (Time Gene)
-  FORCE_REBALANCE_TIMEOUT: 25 * 60 * 1000, // Now Evolvable (Time Gene)
-  FORCE_REBALANCE_SHORTFALL_PERCENT: 0.25,
-  MIN_PARTIAL_REBALANCE_USD: 0.25,
-  MIN_FORCED_REBALANCE_USD: 0.25,
-
-
-  // --- Project Dynamo (Physics) ---
-  SPAR_DRAG_COEFFICIENT: 0.999968, // Now Evolvable (Physics Gene)
-  SPAR_DRAG_GRACE_COEFFICIENT: 0.999998, // Now Evolvable (Ultra-Slow Grace Drag for first 48h)
-
-  // --- Crash Protection ---
-  ENABLE_CRASH_PROTECTION: true,
-  CP_TRIGGER_ASSET_PERCENT: 0.70,
-  CP_TRIGGER_MIN_NEGATIVE_DEV_PERCENT: -0.07, // Now Evolvable (Risk Gene)
-  CRASH_PROTECTION_THRESHOLD_INCREASE: 2,
-  CRASH_PROTECTION_PARTIAL_RECOVERY_PERCENT: 0.33,
-
-  // --- Timing ---
-  REFRESH_INTERVAL: 8000, // 8s for Eco Mode
-
-  // --- Smart Evolution Strategy ---
-  ALLOCATION_MODE: 1, // 0=BALANCED, 1=GROWTH, 2=DEFENSIVE
-  REINVEST_WEIGHT_EXPONENT: 1.50, // 1.0 (Linear) to 3.0 (Cubic/Sniper)
-  FITNESS_DRAWDOWN_PENALTY: 1.00, // Score Penalty Multiplier for Max Drawdown % (e.g. 2.0 = 2x penalty)
-
-  // --- Evolution & Oracle ---
-  MIN_TRADES_FOR_PROMOTION: 1,
-  EVOLUTION_CONSISTENCY_COUNT: 3, // Wins needed for Hall of Fame
-  ORACLE_TREND_THRESHOLD: 0.8, // 🧬 Evolutionary: How strong a trend needs to be for Oracle intervention
-  ORACLE_VOLATILITY_THRESHOLD: 2.0, // 🧬 Evolutionary: How high volatility needs to be for Oracle intervention
-  EVOLUTION_INTERVAL_MINUTES: 5, // How often to check for promotions (1-60 min range evolvable)
-
-  // --- Developer / Debug ---
-  ENABLE_DEVELOPER_LOGS: true,
-
-  // --- Per-Asset Overrides ---
-  overrides: {} // Structure: { "BTC": { FLAT_HARVEST_TRIGGER_PERCENT: 0.05 }, "ETH": { ... } }
-};
+// (defaultGenome imported from constants.mjs)
 
 // --- Active Genome State ---
 let currentGenome = { ...defaultGenome };
@@ -1938,49 +1832,12 @@ function printTable(headers, rows) {
 
 
 // ============== Helper Functions ==============
-function getGenomicParam(genome, key, symbol) {
-  // 1. Check for Asset-Specific Override
-  if (symbol && genome.overrides && genome.overrides[symbol] && genome.overrides[symbol][key] !== undefined) {
-    return genome.overrides[symbol][key];
-  }
-  // 2. Return Global Default
-  return genome[key];
-}
-
-function roundQty(sym, qty) {
-  const step = minIncrementMap[sym] || 0.00000001;
-  if (typeof qty !== 'number' || isNaN(qty) || qty < (step / 10)) return "0.0";
-
-  const rounded = Math.floor(qty / step) * step;
-  let decimalPlaces = 0;
-  if (step < 1) {
-    decimalPlaces = Math.round(-Math.log10(step));
-  }
-
-  let str = rounded.toFixed(Math.min(18, Math.max(0, decimalPlaces)));
-  str = str.replace(/(\.\d*[1-9])0+$/, "$1");
-  str = str.replace(/\.0+$/, "");
-  return Number(str) < (step / 10) ? "0.0" : str;
-}
+// (getGenomicParam, roundQty, checkMinQuantity, parseOptionalNumber imported from utils/)
 
 function checkMinTrade(usdValue) {
   const MIN_TRADE_USD = 0.25;
   if (usdValue < MIN_TRADE_USD) {
-    // console.log(`   🔸 Dust Trade Skipped (< $${MIN_TRADE_USD}): $${usdValue.toFixed(2)}`);
     return false;
-  }
-  return true;
-}
-
-function checkMinQuantity(symbol, qty) {
-  const minQty = MIN_ORDER_QTY_MAP[symbol];
-  if (minQty) {
-    if (parseFloat(qty) < minQty) return false;
-  } else {
-    // Fallback: $0.50 minimum order value
-    // We don't have price here, so we'll be lenient and allow the order
-    // The actual min qty check happens in the exchange
-    // This is a safety net only
   }
   return true;
 }
@@ -1989,11 +1846,6 @@ function logTrade({ asset, side, quantity, price, clientOrderId, note = "", gros
   try {
     const quantityNum = parseFloat(quantity); const priceNum = parseFloat(price); if (isNaN(quantityNum) || isNaN(priceNum) || priceNum <= 0) { console.error(`Error logging trade: Invalid numeric values. Qty: ${quantity}, Price: ${price}`); return; } const totalValue = (quantityNum * priceNum).toFixed(2); const grossValueNum = parseOptionalNumber(grossValue) ?? (quantityNum * priceNum); const totalFeesNum = parseOptionalNumber(totalFees) ?? 0; const settledValueNum = parseOptionalNumber(settledValue) ?? Math.max(0, grossValueNum - totalFeesNum); appendTradeHistory({ asset, side: side.toUpperCase(), orderType: "market", quantity, effectivePrice: price, totalValue, grossValue: grossValueNum.toFixed(8), totalFees: totalFeesNum.toFixed(8), settledValue: settledValueNum.toFixed(8), clientOrderId, extra: { note } });
   } catch (error) { console.error(`Error logging trade for ${asset}:`, error); }
-}
-
-function parseOptionalNumber(value) {
-  const num = parseFloat(value);
-  return Number.isFinite(num) ? num : null;
 }
 
 function appendTradeHistory(tradeRecord) {
@@ -2013,7 +1865,7 @@ function pruneMarketDataFile() {
   if (!fs.existsSync(logFile)) return;
   try {
     const stats = fs.statSync(logFile);
-    const MAX_SIZE = 100 * 1024 * 1024; // 100MB cap for HDD / low-spec comfort
+    const MAX_SIZE = 100 * 1024 * 1024;
     if (stats.size > MAX_SIZE) {
       console.log(`🧹 [Startup Pruning] Market data file size is ${(stats.size / 1024 / 1024).toFixed(2)}MB. Pruning to save HDD performance...`);
       const content = fs.readFileSync(logFile, 'utf-8');
@@ -2036,12 +1888,10 @@ function appendMarketData(timestamp, portfolioSummary) {
 
   marketDataBuffer.push(entry);
 
-  // Flush buffer to disk every ~2 minutes (15 ticks assuming 8s intervals) to prevent constant drive lock
   if (marketDataBuffer.length >= 15 || (Date.now() - lastMarketDataFlush > 120000)) {
     const logFile = path.join(process.cwd(), 'market_data.jsonl');
     const bulkData = marketDataBuffer.join('\n') + '\n';
 
-    // HDD Optimization: Lightweight sequential append without any heavy size checks during runtime
     fs.appendFile(logFile, bulkData, (err) => {
       if (err) console.error("Error appending market data:", err);
     });
@@ -2118,37 +1968,7 @@ function loadRecentMarketData(limit = 200) {
     }
   }
 }
-function getEffectivePriceFromResp(resp, fallbackPrice) {
-  const priceStr = resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price || fallbackPrice?.toString(); if (priceStr === undefined || priceStr === null) return null; const priceNum = parseFloat(priceStr); return !isNaN(priceNum) && priceNum > 0 ? priceNum : null;
-}
-
-function getFilledQuantityFromResp(resp, fallbackQuantity = null) {
-  const filledQty = parseOptionalNumber(resp?.filled_asset_quantity ?? resp?.filled_quantity);
-  if (filledQty !== null && filledQty > 0) return filledQty;
-  const fallbackQty = parseOptionalNumber(fallbackQuantity);
-  return fallbackQty !== null && fallbackQty > 0 ? fallbackQty : 0;
-}
-
-function getTotalFeesFromResp(resp) {
-  const fees = parseOptionalNumber(resp?.total_fees ?? resp?.fees ?? resp?.raw?.order?.total_fees ?? resp?.raw?.total_fees);
-  return fees !== null && fees >= 0 ? fees : 0;
-}
-
-function getGrossValueFromResp(resp, fallbackQuantity = null, fallbackPrice = null) {
-  const filledValue = parseOptionalNumber(resp?.filled_value ?? resp?.quote_value ?? resp?.raw?.order?.filled_value ?? resp?.raw?.filled_value);
-  if (filledValue !== null && filledValue >= 0) return filledValue;
-  const qty = getFilledQuantityFromResp(resp, fallbackQuantity);
-  const price = getEffectivePriceFromResp(resp, fallbackPrice);
-  return qty > 0 && price !== null && price > 0 ? qty * price : 0;
-}
-
-function getSettledValueFromResp(resp, fallbackQuantity = null, fallbackPrice = null) {
-  const netValue = parseOptionalNumber(resp?.total_value_after_fees ?? resp?.net_value ?? resp?.raw?.order?.total_value_after_fees ?? resp?.raw?.total_value_after_fees);
-  if (netValue !== null && netValue >= 0) return netValue;
-  const grossValue = getGrossValueFromResp(resp, fallbackQuantity, fallbackPrice);
-  const fees = getTotalFeesFromResp(resp);
-  return grossValue > 0 ? Math.max(0, grossValue - fees) : 0;
-}
+// (getEffectivePriceFromResp, getFilledQuantityFromResp, getTotalFeesFromResp, getGrossValueFromResp, getSettledValueFromResp imported from helpers.mjs)
 
 function parsePreviewOrderArgs(argv = process.argv) {
   const sellIdx = argv.indexOf('--preview-sell');
