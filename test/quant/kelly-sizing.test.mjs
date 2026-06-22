@@ -10,16 +10,18 @@ import { kellySpawnCost } from '../../src/worm/estimation/kalman.mjs';
 // ── kellySpawnCost ────────────────────────────────────────────────────────────
 
 describe('kellySpawnCost: floor/ceiling/formula', () => {
-  test('returns floor when kellyFraction is null (insufficient history)', () => {
-    assert.equal(kellySpawnCost(null, 10_000, 30, 500), 30);
+  test('returns 1% of portfolio when kellyFraction is null (bootstrap fallback)', () => {
+    // $10k portfolio, 1% = $100 — portfolio-scaled, not a flat constant
+    assert.equal(kellySpawnCost(null, 10_000, 30, 500), 100);
   });
 
-  test('returns floor when kellyFraction is 0', () => {
-    assert.equal(kellySpawnCost(0, 10_000, 30, 500), 30);
+  test('returns 1% of portfolio when kellyFraction is 0', () => {
+    assert.equal(kellySpawnCost(0, 10_000, 30, 500), 100);
   });
 
-  test('returns floor when kellyFraction is negative', () => {
-    assert.equal(kellySpawnCost(-0.1, 10_000, 30, 500), 30);
+  test('floor still applies when 1% < minSpawnCostUsd', () => {
+    // $500 portfolio, 1% = $5 < floor $30 -> floor wins
+    assert.equal(kellySpawnCost(null, 500, 30, 500), 30);
   });
 
   test('scales with portfolio value', () => {

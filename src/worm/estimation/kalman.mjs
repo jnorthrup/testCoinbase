@@ -180,9 +180,12 @@ export { KalmanFilter1D, MultiAssetKalman, kalmanSlipCap, kalmanHarvestThreshold
 // @param {number}      minSpawnCostUsd  — hard floor (e.g. 30)
 // @param {number}      maxSpawnCostUsd  — hard ceiling (e.g. 500)
 export function kellySpawnCost(kellyFraction, totalPortfolioUsd, minSpawnCostUsd = 30, maxSpawnCostUsd = 500) {
-  if (kellyFraction === null || kellyFraction <= 0 || totalPortfolioUsd <= 0) {
-    return minSpawnCostUsd;
-  }
-  const raw = kellyFraction * totalPortfolioUsd;
+  // Bootstrap fallback: no history yet — use 1% of portfolio (conservative but portfolio-scaled).
+  // Never a flat $30 constant — that makes spawn size independent of capital size.
+  const effectiveFraction = (kellyFraction === null || kellyFraction <= 0)
+    ? 0.01
+    : kellyFraction;
+  if (totalPortfolioUsd <= 0) return minSpawnCostUsd;
+  const raw = effectiveFraction * totalPortfolioUsd;
   return Math.max(minSpawnCostUsd, Math.min(maxSpawnCostUsd, raw));
 }
