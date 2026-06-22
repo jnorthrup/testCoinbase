@@ -22,6 +22,7 @@ import {
 import { TradeHistoryAnalyzer } from './trade-history-analyzer.mjs';
 import { SweepStateManager } from '../legion/sweep-state-manager.mjs';
 import { loadRecentMarketData, appendMarketData, pruneMarketDataFile } from '../utils/trade-logger.mjs';
+import { TradingEngine } from '../engine/trading-engine.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },

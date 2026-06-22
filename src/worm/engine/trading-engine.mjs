@@ -328,12 +328,12 @@ export class TradingEngine {
   }
 
   _logTrade(data) {
-    this.totalTrades++; // Increment trade count for metrics
-    if (this.cycleTrades) this.cycleTrades.push(data.asset); // Track for Dreamer Focus
+    this.totalTrades++;
+    if (this.cycleTrades) this.cycleTrades.push(data.asset);
+    // Feed Kelly stats in-memory regardless of mode — paper trades count too.
+    this._historyAnalyzer.recordTrade(data);
     if (this.mode === 'LIVE') {
       logTrade(data);
-    } else {
-      // console.log(`[SHADOW LOG] ${JSON.stringify(data)}`);
     }
   }
 

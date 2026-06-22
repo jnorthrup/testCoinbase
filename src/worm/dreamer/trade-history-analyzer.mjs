@@ -60,6 +60,36 @@ export class TradeHistoryAnalyzer {
     } catch (err) { console.error("Error loading history:", err); }
   }
 
+  // Incrementally record a trade in-memory (called from _logTrade in both live and paper).
+  // Does NOT write to file — use logTrade() for the audit trail.
+  // This keeps Kelly stats current without re-parsing the log each cycle.
+  recordTrade(data) {
+    if (!this.loaded) this.loadHistory(); // seed from file first if not yet loaded
+    const sym = data.asset;
+    if (!sym || !data.side) return;
+    if (!this.stats[sym]) this.stats[sym] = { wins: 0, losses: 0, pnl: 0, totalTrades: 0, sumWin: 0, sumLoss: 0 };
+    const s = this.stats[sym];
+    const val = parseFloat(data.totalValue || data.price * data.quantity || 0);
+    if (!val) return;
+    s.totalTrades++;
+    if (data.side === 'BUY') {
+      s.pnl -= val;
+      if (!this._openBuys) this._openBuys = {};
+      if (!this._openBuys[sym]) this._openBuys[sym] = [];
+      this._openBuys[sym].push({ cost: val, qty: parseFloat(data.quantity || 0) });
+    } else if (data.side === 'SELL') {
+      s.pnl += val;
+      const open = this._openBuys?.[sym];
+      if (open && open.length > 0) {
+        const buy = open.shift();
+        const fees = parseFloat(data.totalFees || 0);
+        const profit = (val - fees) - buy.cost;
+        if (profit >= 0) { s.wins++; s.sumWin += profit; }
+        else             { s.losses++; s.sumLoss += Math.abs(profit); }
+      }
+    }
+  }
+
   // Kelly fraction for a symbol: f* = (p*b - q) / b
   // Returns null if insufficient data (< 5 closed trades).
   kellyFraction(sym) {
