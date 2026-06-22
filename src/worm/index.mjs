@@ -23,6 +23,6 @@ export {
   roundQty,
   verifyOrder,
 } from './utils/trading-helpers.mjs';
-export { SweepStateManager } from './optimizer/sweep-state-manager.mjs';
-export { TradeHistoryAnalyzer } from './optimizer/trade-history-analyzer.mjs';
+export { SweepStateManager } from './legion/sweep-state-manager.mjs';
+export { TradeHistoryAnalyzer } from './dreamer/trade-history-analyzer.mjs';
 export { TradingEngine } from './engine/trading-engine.mjs';
