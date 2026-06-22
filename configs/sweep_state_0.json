@@ -1,14 +1,15 @@
 {
-  "currentAssetIndex": 0,
-  "combinationsChecked": 0,
-  "mode": "MICRO_GRID",
-  "hIndex": 0,
-  "rIndex": 0,
+  "currentAssetIndex": 87,
+  "combinationsChecked": 200,
+  "mode": "GRID",
+  "hIndex": 11,
+  "rIndex": 12,
   "paramIndex": 0,
   "val": null,
-  "swarmInit": false,
-  "microPhase": "SWEEP_H",
+  "swarmInit": true,
+  "microPhase": null,
   "mIndex": 0,
   "anchorH": 0.035,
-  "anchorR": 0.035
+  "anchorR": 0.035,
+  "championChecked": true
 }

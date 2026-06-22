@@ -200,6 +200,7 @@ export class TradingEngine {
   }
 
   async _placeSell(api, symbol, quantity, expectedPrice = null) {
+    if ((this._cycleCounters?.sells ?? 0) >= (this._cycleCounters?.maxSells ?? Infinity)) return null;
     const cleanSymbol = symbol.replace("-USD", "");
     if (!checkMinQuantity(cleanSymbol, quantity)) {
       if (this.mode === 'LIVE') {
@@ -211,10 +212,12 @@ export class TradingEngine {
       try {
         const resp = await api.placeSell(symbol, quantity);
         if (resp?.preview_only) {
+          if (this._cycleCounters) this._cycleCounters.sells++;
           return resp;
         }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
+          if (this._cycleCounters) this._cycleCounters.sells++;
           return verified || resp;
         }
         return resp;
@@ -236,17 +239,18 @@ export class TradingEngine {
       };
       const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
       executedPrice = expectedPrice * (1 - slip);
-      // console.log(`[SHADOW] Selling ${quantity} ${symbol} @ ${executedPrice.toFixed(4)} (Exp: ${expectedPrice})`);
+      if (this._cycleCounters) this._cycleCounters.sells++;
       return {
         id: `shadow_sell_${crypto.randomUUID()}`,
         client_order_id: `oid_${Date.now()}`,
-        average_price: executedPrice.toString() // Return simulated price
+        average_price: executedPrice.toString()
       };
     }
     return null;
   }
 
   async _placeBuy(api, symbol, quantity, expectedPrice = null) {
+    if ((this._cycleCounters?.buys ?? 0) >= (this._cycleCounters?.maxBuys ?? Infinity)) return null;
     const cleanSymbol = symbol.replace("-USD", "");
     if (!checkMinQuantity(cleanSymbol, quantity)) {
       if (this.mode === 'LIVE') {
@@ -258,10 +262,12 @@ export class TradingEngine {
       try {
         const resp = await api.placeBuy(symbol, quantity);
         if (resp?.preview_only) {
+          if (this._cycleCounters) this._cycleCounters.buys++;
           return resp;
         }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
+          if (this._cycleCounters) this._cycleCounters.buys++;
           return verified || resp;
         }
         return resp;
@@ -283,7 +289,7 @@ export class TradingEngine {
       };
       const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.buy;
       executedPrice = expectedPrice * (1 + slip);
-      // console.log(`[SHADOW] Buying ${quantity} ${symbol} @ ${executedPrice.toFixed(4)} (Exp: ${expectedPrice})`);
+      if (this._cycleCounters) this._cycleCounters.buys++;
       return {
         id: `shadow_buy_${crypto.randomUUID()}`,
         client_order_id: `oid_${Date.now()}`,
@@ -354,6 +360,11 @@ export class TradingEngine {
     let harvestedAmount = 0; // Local accumulator
     let matureHarvestedAmount = 0; // Accumulated mature harvests
     let snowballHarvestedAmount = 0; // Accumulated snowball harvests
+    let buysThisCycle = 0;
+    let sellsThisCycle = 0;
+    const MAX_BUYS  = SNOWBALL_CONFIG.MAX_BUYS_PER_CYCLE  ?? 2;
+    const MAX_SELLS = SNOWBALL_CONFIG.MAX_SELLS_PER_CYCLE ?? 2;
+    this._cycleCounters = { buys: 0, sells: 0, maxBuys: MAX_BUYS, maxSells: MAX_SELLS };
     const dynamicCriticalMass = this._getDynamicCriticalMass(portfolioSummary, holdingDetails || this.holdings);
     this.cycleTrades = [];   // Track trades for this cycle to notify Dreamer
     this.postMortemEvents = []; // Reset events
@@ -1332,11 +1343,18 @@ export class TradingEngine {
       );
 
       // Find next unheld queue token (fluid horizontal expansion)
-      const nextSym = Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
-        !HARVEST_EXCLUDE.includes(sym) &&
-        (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
-        (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0)
-      );
+      const MAX_HOLDINGS = SNOWBALL_CONFIG.MAX_HOLDINGS ?? 13;
+      const currentHoldingCount = portfolioSummary.filter(r =>
+        !HARVEST_EXCLUDE.includes(r.Symbol) && (activeHoldings[r.Symbol]?.rawQuantity || 0) > 0
+      ).length;
+
+      const nextSym = currentHoldingCount < MAX_HOLDINGS
+        ? Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
+            !HARVEST_EXCLUDE.includes(sym) &&
+            (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
+            (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0)
+          )
+        : null;
 
       if (nextSym) {
         if (this.cashBalance >= crashFundUSD + spawnCost) {
