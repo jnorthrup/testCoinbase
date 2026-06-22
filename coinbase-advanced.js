@@ -184,6 +184,12 @@ function createClient(credentials = loadCredentials()) {
     createOrder: (body) => request({ method: 'POST', requestPath: 'orders', body, credentials }).then((r) => r.body),
     getOrder: (orderId) => request({ method: 'GET', requestPath: `orders/historical/${orderId}`, credentials }).then((r) => r.body),
     getProducts: () => request({ method: 'GET', requestPath: 'products', credentials }).then((r) => r.body),
+    getCandles: (productId, granularity, start, end) => {
+      const params = new URLSearchParams({ granularity: String(granularity) });
+      if (start) params.set('start', String(start));
+      if (end)   params.set('end',   String(end));
+      return request({ method: 'GET', requestPath: `products/${productId}/candles?${params}`, credentials }).then((r) => r.body);
+    },
   };
 }
 

@@ -901,7 +901,13 @@ async function mainLoop() {
       }
       if (codes.length > 0) {
         console.log(`📊 Holdings: ${codes.join(', ')}`);
-        rhPrices = await rh.getQuotes(codes);
+        // WS: subscribe new symbols (no-op for already-subscribed), seed candles
+        await rh.startWS(codes);
+        // Price step: WS cache first, REST bulk only for stale/missing
+        const wsPrices = rh.getWsPriceMap(codes);
+        const missing  = codes.filter(s => !wsPrices[s]);
+        const restPrices = missing.length > 0 ? await rh.getQuotes(missing) : {};
+        rhPrices = { ...wsPrices, ...restPrices };
       } else {
         console.log("ℹ️ No crypto holdings found.");
         console.log("ℹ️ Skipping quote fetch.");
@@ -910,7 +916,13 @@ async function mainLoop() {
       // Live mode: fetch from API
       try { holdings = await rh.getHoldings(); if (holdings.length === 0) console.log("ℹ️ No crypto holdings found."); } catch (err) { console.error("❌ FATAL: Could not fetch holdings:", err.message); rl.close(); return; }
       if (holdings.length > 0) { holdings.forEach(h => { const code = h.asset_code; const qty = parseFloat(h.total_quantity) || 0; const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10; if (code && qty > minQtyThreshold) { if (!holdingDetails[code]) { holdingDetails[code] = { rawQuantity: 0 }; codes.push(code); } holdingDetails[code].rawQuantity += qty; } }); if (codes.length > 0) console.log(`📊 Holdings: ${codes.join(', ')}`); else console.log("ℹ️ No significant crypto holdings found after filtering."); }
-      if (codes.length > 0) { try { rhPrices = await rh.getQuotes(codes); } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
+      if (codes.length > 0) { try {
+        await rh.startWS(codes);
+        const wsPrices2  = rh.getWsPriceMap(codes);
+        const missing2   = codes.filter(s => !wsPrices2[s]);
+        const restPrices2 = missing2.length > 0 ? await rh.getQuotes(missing2) : {};
+        rhPrices = { ...wsPrices2, ...restPrices2 };
+      } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
     }
 
     // Calculate Portfolio Summary & Initialize/Verify Baselines & State (Unchanged)
