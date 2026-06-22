@@ -170,3 +170,19 @@ function kalmanCrashFund(kalman, symbols, minSpawnCostUsd, spawnBufferCount, tot
 }
 
 export { KalmanFilter1D, MultiAssetKalman, kalmanSlipCap, kalmanHarvestThreshold, kalmanCrashFund };
+
+// Kelly-sized spawn cost.
+// f* = kellyFraction from TradeHistoryAnalyzer (null = no data yet).
+// Falls back to minSpawnCostUsd when data is insufficient.
+// Half-Kelly is already enforced in TradeHistoryAnalyzer.kellyFraction (cap 0.25).
+// @param {number|null} kellyFraction   — f* from TradeHistoryAnalyzer, or null
+// @param {number}      totalPortfolioUsd
+// @param {number}      minSpawnCostUsd  — hard floor (e.g. 30)
+// @param {number}      maxSpawnCostUsd  — hard ceiling (e.g. 500)
+export function kellySpawnCost(kellyFraction, totalPortfolioUsd, minSpawnCostUsd = 30, maxSpawnCostUsd = 500) {
+  if (kellyFraction === null || kellyFraction <= 0 || totalPortfolioUsd <= 0) {
+    return minSpawnCostUsd;
+  }
+  const raw = kellyFraction * totalPortfolioUsd;
+  return Math.max(minSpawnCostUsd, Math.min(maxSpawnCostUsd, raw));
+}

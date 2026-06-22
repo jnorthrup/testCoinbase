@@ -18,7 +18,8 @@ import {
   getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
   getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
 } from '../utils/helpers.mjs';
-import { MultiAssetKalman, kalmanSlipCap } from '../estimation/kalman.mjs';
+import { MultiAssetKalman, kalmanSlipCap, kellySpawnCost } from '../estimation/kalman.mjs';
+import { TradeHistoryAnalyzer } from '../dreamer/trade-history-analyzer.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },
@@ -53,6 +54,7 @@ export class TradingEngine {
 
     // --- Simulation State (Shadow Only) ---
     this.cashBalance = initialCapital;
+    this._historyAnalyzer = new TradeHistoryAnalyzer();
     this.holdings = initialHoldings; // { SYM: qty }
     this.totalHarvested = 0; // Track performance (Cumulative Lifetime)
     this.totalTrades = 0;    // Track activity level
@@ -1319,7 +1321,15 @@ export class TradingEngine {
       const currentTotalPortfolioValue = portfolioSummary.reduce((sum, r) => sum + r.Value, 0) + this.cashBalance;
       const crashFundThreshold = currentGenome.CRASH_FUND_THRESHOLD_PERCENT ?? 0.10;
       const crashFundUSD = currentTotalPortfolioValue * crashFundThreshold;
-      const spawnCost = SNOWBALL_CONFIG.MIN_SPAWN_COST_USD || 30.00;
+      // Kelly-sized spawn cost: f* × portfolio, floored at MIN_SPAWN_COST_USD.
+      // Falls back to the constant when trade history is insufficient (< 5 closed rounds).
+      const _kellyF = this._historyAnalyzer.portfolioKellyFraction();
+      const spawnCost = kellySpawnCost(
+        _kellyF,
+        currentTotalPortfolioValue,
+        SNOWBALL_CONFIG.MIN_SPAWN_COST_USD || 30,
+        SNOWBALL_CONFIG.MAX_SPAWN_COST_USD || 500,
+      );
 
       // Find next unheld queue token (fluid horizontal expansion)
       const nextSym = Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
