@@ -72,8 +72,8 @@ export class TradeHistoryAnalyzer {
     const q = 1 - p;
     const avgWin  = s.wins   > 0 ? s.sumWin  / s.wins   : 0;
     const avgLoss = s.losses > 0 ? s.sumLoss / s.losses : 1; // avoid div/0
-    const b = avgWin / avgLoss; // win/loss ratio
-    if (b <= 0) return null;
+    const b = avgWin / Math.max(avgLoss, 1e-9); // win/loss ratio
+    if (!Number.isFinite(b)) return null;
     const f = (p * b - q) / b;
     return Math.max(0, Math.min(0.25, f)); // hard cap at 25% — half-Kelly safety
   }
@@ -95,8 +95,8 @@ export class TradeHistoryAnalyzer {
     const q = 1 - p;
     const avgWin  = totalWins   > 0 ? sumWin  / totalWins   : 0;
     const avgLoss = totalLosses > 0 ? sumLoss / totalLosses : 1;
-    const b = avgWin / avgLoss;
-    if (b <= 0) return null;
+    const b = avgWin / Math.max(avgLoss, 1e-9);
+    if (!Number.isFinite(b)) return null;
     const f = (p * b - q) / b;
     return Math.max(0, Math.min(0.25, f));
   }
