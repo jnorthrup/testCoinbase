@@ -53,7 +53,11 @@ class CoinbaseWormAPI {
         return;
       }
     }
-    await this._ws.subscribe(WS_CHANNELS.TICKER_BATCH, syms);
+    // Only subscribe symbols not already in the ticker_batch subscription.
+    // Avoids re-triggering _seedCandles for the entire holdings list every cycle.
+    const already = this._ws._subscribed.get(WS_CHANNELS.TICKER_BATCH) || new Set();
+    const newSyms  = syms.filter(s => !already.has(`${s.toUpperCase()}-USD`) && !already.has(s.toUpperCase()));
+    if (newSyms.length > 0) await this._ws.subscribe(WS_CHANNELS.TICKER_BATCH, newSyms);
   }
 
   // Returns a price map from WS cache for symbols that are fresh (< 60s).

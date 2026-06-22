@@ -247,10 +247,12 @@ class CoinbaseWS {
     const start = now - CANDLE_SEED_GRANULARITY * CANDLE_SEED_COUNT;
     const gran  = CANDLE_SEED_GRANULARITY;
 
-    // Fire all seeds concurrently but don't let one failure block the rest
     await Promise.allSettled(productIds.map(async (productId) => {
       const key = `${productId}:${gran}`;
-      if (this.candleCache.has(key)) return; // already seeded
+      if (this.candleCache.has(key)) return; // already seeded or previously attempted
+
+      // Mark attempted BEFORE the request — prevents retry storm on Unauthorized
+      this.candleCache.set(key, []);
 
       try {
         const body = await this.restClient.getCandles(productId, gran, start, now);
@@ -269,7 +271,7 @@ class CoinbaseWS {
         this.candleCache.set(key, candles);
         console.log(`[WS] Seeded ${candles.length} candles for ${productId} (${gran}s)`);
       } catch (err) {
-        // Non-fatal — WS updates will populate over time
+        // Non-fatal — sentinel [] already set above, won't retry
         console.warn(`[WS] Candle seed failed for ${productId}: ${err.message}`);
       }
     }));
