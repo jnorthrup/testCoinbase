@@ -18,12 +18,17 @@ import {
   getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
   getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
 } from '../utils/helpers.mjs';
+import { MultiAssetKalman, kalmanSlipCap } from '../estimation/kalman.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },
   has(_, k)  { return k in getMinOrderQtyMap(); },
   getOwnPropertyDescriptor(_, k) { return Object.getOwnPropertyDescriptor(getMinOrderQtyMap(), k); },
 });
+
+// Singleton Kalman filter — one filter per asset, shared across TradingEngine instances.
+// Survives respawns within a process; resets on full restart (acceptable for slippage estimation).
+const _kalman = new MultiAssetKalman({ q: 1e-5, r: 1e-3, x0: 0.001, p0: 0.01 });
 
 export class TradingEngine {
   constructor(genome, mode = 'SHADOW', initialCapital = 0, initialHoldings = {}) {
@@ -222,7 +227,11 @@ export class TradingEngine {
       let executedPrice = expectedPrice || 0;
       const cleanSymbol = symbol.replace('-USD', '');
       const rSt = this.ratchetState[cleanSymbol];
-      const slipConfig = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
+      const _defaultSlip = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
+      const slipConfig = {
+        sell: kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
+        buy:  kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+      };
       const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
       executedPrice = expectedPrice * (1 - slip);
       // console.log(`[SHADOW] Selling ${quantity} ${symbol} @ ${executedPrice.toFixed(4)} (Exp: ${expectedPrice})`);
@@ -265,7 +274,11 @@ export class TradingEngine {
       let executedPrice = expectedPrice || 0;
       const cleanSymbol = symbol.replace('-USD', '');
       const rSt = this.ratchetState[cleanSymbol];
-      const slipConfig = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
+      const _defaultSlip = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
+      const slipConfig = {
+        sell: kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
+        buy:  kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+      };
       const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.buy;
       executedPrice = expectedPrice * (1 + slip);
       // console.log(`[SHADOW] Buying ${quantity} ${symbol} @ ${executedPrice.toFixed(4)} (Exp: ${expectedPrice})`);
@@ -566,6 +579,7 @@ export class TradingEngine {
                   const slippage = (row.Price - effectiveSellPrice) / row.Price;
                   const rStObj = this.ratchetState[row.Symbol] || { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                   rStObj.lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                  _kalman.observe(row.Symbol, Math.min(0.04, Math.max(0, slippage)));
                   this.ratchetState[row.Symbol] = rStObj;
 
                   this._logTrade({ asset: row.Symbol, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `Portfolio Baseline Reset Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
@@ -664,7 +678,11 @@ export class TradingEngine {
         const flatHarvestTrigger = getGenomicParam(currentGenome, 'FLAT_HARVEST_TRIGGER_PERCENT', sym);
 
         const hMod = rSt.harvestModifier || 0.0;
-        const slipConfig = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const slipConfig = {
+          sell: kalmanSlipCap(_kalman, sym, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
+          buy:  kalmanSlipCap(_kalman, sym, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+        };
         const lastSlippage = (rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
         const apiSellSlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].sell : null;
         const effectiveSellSlip = (apiSellSlip !== null) ? Math.max(apiSellSlip, lastSlippage) : lastSlippage;
@@ -744,6 +762,7 @@ export class TradingEngine {
                       this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                     }
                     this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                    _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
                     this._logTrade({ asset: sym, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `${harvestType} Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
                     if (totalVal < dynamicCriticalMass) {
                       snowballHarvestedAmount += settledSoldValue;
@@ -970,6 +989,7 @@ export class TradingEngine {
                         this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                       }
                       this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                      _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
                       // Guarantee cost is never 0: every reinvest buy spends the allocation amount approx
                       const cost = (filledQty > 0 && effectivePrice > 0) ? filledQty * effectivePrice : amountForReinvest;
 
@@ -1035,7 +1055,11 @@ export class TradingEngine {
           global.hasLoggedCPTrigger = false;
         }
 
-        const slipConfig = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const slipConfig = {
+          sell: kalmanSlipCap(_kalman, sym, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
+          buy:  kalmanSlipCap(_kalman, sym, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+        };
         const lastSlippage = (ratSt.lastSlippage !== undefined && ratSt.lastSlippage !== null) ? ratSt.lastSlippage : slipConfig.buy;
         const apiBuySlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].buy : null;
         const effectiveBuySlip = (apiBuySlip !== null) ? Math.max(apiBuySlip, lastSlippage) : lastSlippage;
@@ -1101,6 +1125,7 @@ export class TradingEngine {
                   this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                 }
                 this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
                 this._logTrade({ asset: sym, side: 'BUY', quantity: qty, price: effectivePrice.toString(), clientOrderId: resp.client_order_id || resp.id, note: 'Forced Rebalance' });
                 anyTradesThisCycle = true;
                 // Tier 1: Post-Mortem Event (Forced Rebalance is a significant event)
@@ -1209,6 +1234,7 @@ export class TradingEngine {
                   this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                 }
                 this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
                 this._logTrade({ asset: sym, side: 'BUY', quantity: qty, price: effectivePrice.toString(), clientOrderId: resp.client_order_id || resp.id, note: 'Rebalance Buy' });
                 anyTradesThisCycle = true;
                 // Tier 1: Post-Mortem Event
@@ -1339,6 +1365,7 @@ export class TradingEngine {
                         this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                       }
                       this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
+                      _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
                       const actualCost = filledQty * effectivePrice;
 
                       this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
