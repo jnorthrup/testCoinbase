@@ -1,14 +1,9 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import readline from 'readline';
-import os from 'os';
-import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
+import { roundQty } from '../utils/quantity.mjs';
+import { buildHoldingDetails } from './holding-details.mjs';
+import { writeWormPreviewArtifact } from './artifact-writer.mjs';
 
 export async function runPreviewOrderOnce(engine, api, previewOrder) {
   const cashBalance = await api.getBalance();

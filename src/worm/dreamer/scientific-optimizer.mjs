@@ -10,18 +10,16 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import {
-  minIncrementMap, SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
-  PRECISION_THRESHOLD, SNOWBALL_CONFIG, defaultGenome, getFallbackMinQty,
-  LEGION_CONFIG,
+  SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
+  SNOWBALL_CONFIG, defaultGenome,
 } from '../config/constants.mjs';
-import { roundQty, checkMinQuantity, setMinOrderQtyMap, getMinOrderQtyMap } from '../utils/quantity.mjs';
+import { roundQty, checkMinQuantity, getMinOrderQtyMap } from '../utils/quantity.mjs';
 import {
-  getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
-  getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
+  getTotalFeesFromResp, getGrossValueFromResp, getGenomicParam,
 } from '../utils/helpers.mjs';
 import { TradeHistoryAnalyzer } from './trade-history-analyzer.mjs';
 import { SweepStateManager } from '../legion/sweep-state-manager.mjs';
-import { loadRecentMarketData, appendMarketData, pruneMarketDataFile } from '../utils/trade-logger.mjs';
+import { loadRecentMarketData } from '../utils/trade-logger.mjs';
 import { TradingEngine } from '../engine/trading-engine.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },

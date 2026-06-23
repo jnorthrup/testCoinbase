@@ -10,19 +10,21 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import {
-  minIncrementMap, SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
-  PRECISION_THRESHOLD, SNOWBALL_CONFIG, defaultGenome, getFallbackMinQty,
+  SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
+  PRECISION_THRESHOLD, SNOWBALL_CONFIG, defaultGenome,
 } from '../config/constants.mjs';
-import { roundQty, checkMinQuantity, setMinOrderQtyMap, getMinOrderQtyMap } from '../utils/quantity.mjs';
+import { roundQty, checkMinQuantity, getMinOrderQtyMap } from '../utils/quantity.mjs';
 import {
-  getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
-  getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
+  getEffectivePriceFromResp, getTotalFeesFromResp, getGrossValueFromResp, getGenomicParam,
 } from '../utils/helpers.mjs';
 import {
   verifyOrder, logTrade, checkMinTrade,
 } from '../utils/trading-helpers.mjs';
 import { MultiAssetKalman, kalmanSlipCap, kellySpawnCost } from '../estimation/kalman.mjs';
-import { metricKalmanBaseline } from '../estimation/metrics.mjs';
+import {
+  metricKalmanBaseline,
+  metricSlippageFromBook,
+} from '../estimation/metrics.mjs';
 import { TradeHistoryAnalyzer } from '../dreamer/trade-history-analyzer.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
@@ -90,6 +92,33 @@ function _oracleSlipFloor(api, sym, side) {
     }
   }
   return fallback;
+}
+
+/**
+ * Resolve measured slippage from a snapshot order book via metricSlippageFromBook.
+ * Falls back to `null` when no book is available, letting the caller pick its
+ * next-best oracle. Never throws.
+ *
+ * @param {object} api  - the CoinbaseWormAPI instance
+ * @param {string} sym  - bare ticker (e.g. 'BTC')
+ * @param {'sell'|'buy'} side
+ * @param {number} orderSizeUsd - order size in USD for book-walk impact estimate
+ * @returns {number|null} - measured slippage as fraction, or null if no book available
+ */
+function _bookSlipFromApi(api, sym, side, orderSizeUsd) {
+  try {
+    const getter = api && (api._bookCache?.getBook || api.getProductBook);
+    if (typeof getter !== 'function') return null;
+    const bookOrPromise = getter.call(api._bookCache || api, `${sym}-USD`, 5);
+    const book = (bookOrPromise && typeof bookOrPromise.then === 'function')
+      ? null  // async — don't block the slip computation; oracle floor handles fall-through
+      : bookOrPromise;
+    if (!book || !book.bids || !book.asks) return null;
+    const slip = metricSlippageFromBook(book, side, orderSizeUsd || 100);
+    return Number.isFinite(slip) && slip !== null ? slip : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 export class TradingEngine {
@@ -396,9 +425,18 @@ export class TradingEngine {
       const _defaultSlip = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
       const oracleFloorSell = _oracleSlipFloor(api, cleanSymbol, 'sell');
       const oracleFloorBuy  = _oracleSlipFloor(api, cleanSymbol, 'buy');
+      // Try a measured-spread path: if the adapter exposes a REST book endpoint,
+      // metricSlippageFromBook returns a real walk-the-book figure tied to the
+      // order size in USD. This is the oracle; default-slip is no longer the
+      // primary floor when a book is reachable.
+      const bookOrderSizeUsd = parseFloat(quantity) * expectedPrice || 0;
+      const bookSlipSell = _bookSlipFromApi(api, cleanSymbol, 'sell', bookOrderSizeUsd);
+      const bookSlipBuy  = _bookSlipFromApi(api, cleanSymbol, 'buy',  bookOrderSizeUsd);
+      const sellFloor = Number.isFinite(bookSlipSell) && bookSlipSell !== null ? bookSlipSell : oracleFloorSell;
+      const buyFloor  = Number.isFinite(bookSlipBuy)  && bookSlipBuy  !== null ? bookSlipBuy  : oracleFloorBuy;
       const slipConfig = {
-        sell: kalmanSlipCap(_kalman, cleanSymbol, Math.min(oracleFloorSell, _defaultSlip.sell), Math.min(0.08, _defaultSlip.sell * 3)),
-        buy:  kalmanSlipCap(_kalman, cleanSymbol, Math.min(oracleFloorBuy,  _defaultSlip.buy),  Math.min(0.08, _defaultSlip.buy  * 3)),
+        sell: kalmanSlipCap(_kalman, cleanSymbol, Math.min(sellFloor, _defaultSlip.sell), Math.min(0.08, _defaultSlip.sell * 3)),
+        buy:  kalmanSlipCap(_kalman, cleanSymbol, Math.min(buyFloor,  _defaultSlip.buy),  Math.min(0.08, _defaultSlip.buy  * 3)),
       };
       const baselineSlip = side === 'BUY' ? slipConfig.buy : slipConfig.sell;
       const lastSlip = rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null ? rSt.lastSlippage : baselineSlip;

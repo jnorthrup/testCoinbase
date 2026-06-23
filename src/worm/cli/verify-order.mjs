@@ -1,15 +1,6 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import readline from 'readline';
-import os from 'os';
-import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
-
 export async function verifyOrder(api, orderId, symbol, maxRetries = 6, delayMs = 1500) {
   if (!api || !orderId) return null;
   console.log(`🔍 [Verification] Starting status polling for order: ${orderId} (${symbol})`);

@@ -1,15 +1,11 @@
 // --- LegionManager (Embedded) ---
 import { EventEmitter } from 'events';
 import {
-  minIncrementMap, SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
-  PRECISION_THRESHOLD, SNOWBALL_CONFIG, defaultGenome, getFallbackMinQty,
-  LEGION_CONFIG,
+  SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE,
+  SNOWBALL_CONFIG, defaultGenome, LEGION_CONFIG,
 } from '../config/constants.mjs';
-import { roundQty, checkMinQuantity, setMinOrderQtyMap, getMinOrderQtyMap } from '../utils/quantity.mjs';
-import {
-  getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
-  getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
-} from '../utils/helpers.mjs';
+import { getMinOrderQtyMap } from '../utils/quantity.mjs';
+import { getGenomicParam } from '../utils/helpers.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },

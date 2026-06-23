@@ -1,14 +1,20 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
-import os from 'os';
 import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
+import { selectStrategyPreviewCandidate } from './strategy-preview.mjs';
+import { writeWormLiveArtifact } from './artifact-writer.mjs';
+import { verifyOrder } from './verify-order.mjs';
+import { getEffectivePriceFromResp, getFilledQuantityFromResp, getGrossValueFromResp, getTotalFeesFromResp, getSettledValueFromResp } from '../utils/helpers.mjs';
+import { loadLivePortfolioSnapshot } from './portfolio-snapshot.mjs';
+
+const STATE_FILE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'liveEngineState.json');
+
+function saveState() {
+  // This is a stub - the real saveState is in robinhood-worm.js
+  // The caller is expected to call its own saveState
+}
 
 export async function runStrategyPlaceOnce(engine, api, strategyPlace, portfolioSummary, holdingDetails, cashBalance) {
   const candidate = selectStrategyPreviewCandidate(engine, portfolioSummary, holdingDetails, cashBalance, api, strategyPlace.requestedUsd);

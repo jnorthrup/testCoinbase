@@ -1,14 +1,10 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import readline from 'readline';
-import os from 'os';
-import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
+import { SLIPPAGE_BUFFERS, HARVEST_EXCLUDE, REBALANCE_EXCLUDE } from '../config/constants.mjs';
+import { roundQty, checkMinQuantity } from '../utils/quantity.mjs';
+import { checkMinTrade } from '../utils/format.mjs';
+import { getGenomicParam } from '../utils/helpers.mjs';
 
 export function getLiveTriggerEnvelope(engine, symbol, api) {
   const ratchet = engine?.ratchetState?.[symbol] || null;

@@ -33,7 +33,11 @@ export const SLIPPAGE_BUFFERS = {
   LIT: { buy: 0.0100, sell: 0.0105 },
   DOGE: { buy: 0.0104, sell: 0.0111 },
   ADA: { buy: 0.0101, sell: 0.0110 },
-  DEFAULT: { buy: 0.0097, sell: 0.0100 },
+  // DEFAULT is a *ceiling only* — the engine MUST resolve slip from a live oracle
+  // (_oracleSlipFloor / metricSlippageFromBook) before this constant. These small
+  // values reflect measured top-of-book spread on liquid products (BTC, ETH ~ 5-50 bp).
+  // Bumping them above 0.001 will inflate every SIM fill and silently drift state.
+  DEFAULT: { buy: 0.0005, sell: 0.0005 },
 };
 
 // Exclusion lists

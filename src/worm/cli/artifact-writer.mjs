@@ -1,14 +1,8 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
-import os from 'os';
-import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
 
 export function writeWormArtifact(payload, modeLabel = 'preview') {
   const dir = path.join(process.cwd(), 'runs');

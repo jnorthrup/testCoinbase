@@ -1,14 +1,8 @@
 // Lifted from robinhood-worm.js — Python array scissor.
 // Full shared imports cloned. DCE later.
 
-import dotenv from 'dotenv';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import readline from 'readline';
-import os from 'os';
-import { fileURLToPath } from 'url';
-import { fork } from 'child_process';
+import { selectStrategyPreviewCandidate } from './strategy-preview.mjs';
+import { writeWormPreviewArtifact } from './artifact-writer.mjs';
 
 export async function runStrategyPreviewOnce(engine, api, strategyPreview, portfolioSummary, holdingDetails, cashBalance) {
   const candidate = selectStrategyPreviewCandidate(engine, portfolioSummary, holdingDetails, cashBalance, api, strategyPreview.requestedUsd);

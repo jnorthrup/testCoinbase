@@ -96,8 +96,7 @@ class CoinbaseWS {
       });
 
       this.ws.on('message', (raw) => {
-        try { this._handleMessage(JSON.parse(raw)); }
-        catch (e) { /* ignore parse errors */ }
+        try { this._handleMessage(JSON.parse(raw)); } catch { /* ignore parse errors */ }
       });
 
       this.ws.on('error', (err) => {
@@ -126,13 +125,12 @@ class CoinbaseWS {
 
   // Subscribe to ticker_batch for real-time prices (main use case).
   // Note: ticker_batch is a PUBLIC channel — no JWT required.
-  // We skip candle seeding since it requires authenticated endpoints.
+  // We opportunistically seed candle cache from REST on subscribe; the call
+  // is non-fatal — if the API key lacks marketdata scope the seed sets an
+  // empty-key sentinel and emits a single warning rather than retrying.
   async subscribe(channel, symbols) {
     const ids = (Array.isArray(symbols) ? symbols : [symbols]).map(normalizeProductId);
     if (ids.length === 0) return;
-
-    // Skip candle seeding — candles endpoint requires marketdata scope (authenticated).
-    // WS ticker_batch provides real-time prices without any auth.
 
     const msg = { type: 'subscribe', channel, product_ids: ids };
     // Note: we intentionally DON'T add JWT here — ticker_batch is public.
@@ -146,6 +144,13 @@ class CoinbaseWS {
 
     if (!this._subscribed.has(channel)) this._subscribed.set(channel, new Set());
     ids.forEach(id => this._subscribed.get(channel).add(id));
+
+    // Opportunistic REST candle seed (closes rga Gap #5 + #7). Never throws;
+    // empty-sentinel pattern prevents retry storm on Unauthorized.
+    if (this.restClient && typeof this.restClient.getCandles === 'function') {
+      // Fire-and-forget — candle cache writes are idempotent.
+      this._seedCandles(ids).catch(() => {});
+    }
   }
 
   // Update subscriptions when holdings change mid-run

@@ -3,8 +3,6 @@
 // Each metric takes observable state and returns a derived value.
 // The relationships are explicit: state in, value out.
 
-import { SLIPPAGE_BUFFERS } from '../config/constants.mjs';
-
 // =====================================================================
 // 1. SLIPPAGE: derived from real spread (REST /products/<id>/book)
 // =====================================================================

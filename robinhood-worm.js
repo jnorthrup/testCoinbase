@@ -1,61 +1,40 @@
 // Cryptobot Token Flex (ESM style) - v4.0.0 "Hyper-Evolutionary" - All Parameters Evolvable
 
 import dotenv from "dotenv";
-import crypto from "crypto";
 import readline from "readline";
 import fs from 'fs';
 import path from "path";
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
-import os from 'os';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
 import { createWalletFacade } from './src/worm/api/wallet-facade.mjs';
-import { createClient, buildMinOrderQtyMap, PERP_EXCLUDE, ETF_EXCLUDE, INDEX_EXCLUDE } from './coinbase-advanced.js';
+import { createClient, buildMinOrderQtyMap } from './coinbase-advanced.js';
 import {
   minIncrementMap,
   SLIPPAGE_BUFFERS,
   HARVEST_EXCLUDE,
   REBALANCE_EXCLUDE,
-  PRECISION_THRESHOLD,
   SNOWBALL_CONFIG,
   defaultGenome,
-  getFallbackMinQty,
 } from './src/worm/config/constants.mjs';
-import { roundQty, checkMinQuantity, setMinOrderQtyMap } from './src/worm/utils/quantity.mjs';
-import {
-  getEffectivePriceFromResp,
-  getFilledQuantityFromResp,
-  getSettledValueFromResp,
-  getTotalFeesFromResp,
-  getGrossValueFromResp,
-  parseOptionalNumber,
-  getGenomicParam,
-} from './src/worm/utils/helpers.mjs';
+import { setMinOrderQtyMap } from './src/worm/utils/quantity.mjs';
+import { getGenomicParam } from './src/worm/utils/helpers.mjs';
 
 dotenv.config();
 
 // ─── Lifted submodules ───────────────────────────────────────────────────────
 import { TradingEngine } from './src/worm/engine/trading-engine.mjs';
-import { SweepStateManager } from './src/worm/legion/sweep-state-manager.mjs';
-import { TradeHistoryAnalyzer } from './src/worm/dreamer/trade-history-analyzer.mjs';
-import { ScientificOptimizer } from './src/worm/dreamer/scientific-optimizer.mjs';
-import { parsePreviewOrderArgs, parseStrategyPreviewArgs, parseStrategyPlaceArgs } from './src/worm/cli/args.mjs';
-import { getLiveTriggerEnvelope, selectStrategyPreviewCandidate } from './src/worm/cli/strategy-preview.mjs';
-import { writeWormArtifact, writeWormPreviewArtifact, writeWormLiveArtifact } from './src/worm/cli/artifact-writer.mjs';
-import { buildHoldingDetails } from './src/worm/cli/holding-details.mjs';
-import { loadLivePortfolioSnapshot } from './src/worm/cli/portfolio-snapshot.mjs';
-import { runPreviewOrderOnce } from './src/worm/cli/run-preview.mjs';
-import { runStrategyPreviewOnce } from './src/worm/cli/run-strategy-preview.mjs';
-import { runStrategyPlaceOnce } from './src/worm/cli/run-strategy-place.mjs';
-import { verifyOrder } from './src/worm/cli/verify-order.mjs';
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ===== Lifted blocks (cloned imports per file): regenerated here for now (DCE later) =====
 import { AssetRegimeManager } from './src/worm/regime/asset-regime-manager.mjs';
 import { RegimeDetector } from './src/worm/regime/regime-detector.mjs';
 import { LegionManager } from './src/worm/legion/legion-manager.mjs';
-import { printTable, checkMinTrade } from './src/worm/utils/format.mjs';
-import { logTrade, pruneMarketDataFile, appendMarketData, loadRecentMarketData } from './src/worm/utils/trade-logger.mjs';
+import { printTable } from './src/worm/utils/format.mjs';
+import { loadRecentMarketData, pruneMarketDataFile, appendMarketData } from './src/worm/utils/trade-logger.mjs';
+import { parsePreviewOrderArgs, parseStrategyPreviewArgs, parseStrategyPlaceArgs } from './src/worm/cli/args.mjs';
+import { runPreviewOrderOnce } from './src/worm/cli/run-preview.mjs';
+import { runStrategyPreviewOnce } from './src/worm/cli/run-strategy-preview.mjs';
+import { runStrategyPlaceOnce } from './src/worm/cli/run-strategy-place.mjs';
+import { ScientificOptimizer } from './src/worm/dreamer/scientific-optimizer.mjs';
+// ─────────────────────────────────────────────────────────────────────────────
 
 
 // Dynamic MIN_ORDER_QTY_MAP fetched from Coinbase products
