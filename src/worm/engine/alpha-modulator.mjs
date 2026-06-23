@@ -36,7 +36,6 @@ export function modulateHarvestTrigger(baseTrigger, conviction) {
   if (typeof conviction !== 'number' || Math.abs(conviction) < 0.1) {
     return baseTrigger;
   }
-  // conviction in [-1,1] → modulation roughly [-0.015, +0.015]
   const mod = Math.max(-0.015, Math.min(0.015, conviction * 0.04));
   return baseTrigger + mod;
 }
@@ -50,7 +49,7 @@ export function modulateRebalanceTrigger(baseTrigger, conviction) {
   if (typeof conviction !== 'number' || Math.abs(conviction) < 0.1) {
     return baseTrigger;
   }
-  const mod = Math.max(-0.015, Math.min(0.015, -conviction * 0.035)); // opposite sign for rebalance
+  const mod = Math.max(-0.015, Math.min(0.015, -conviction * 0.035));
   return baseTrigger + mod;
 }
 
@@ -66,6 +65,24 @@ export function modulateSpawnConviction(baseKellyFraction, conviction) {
 
 /**
  * Convenience: get modulated triggers in one call (for use inside TradingEngine update loop).
+ * 
+ * === DIRECT INTEGRATION RECIPE (for trading-engine.mjs) ===
+ * 
+ * Around the harvest/rebalance trigger calculation block:
+ * 
+ *   const modulated = getAlphaModulatedTriggers({
+ *     flatHarvestTrigger,
+ *     flatRebalanceTrigger,
+ *     harvestModifier: hMod,
+ *     rebalanceModifier: rMod,
+ *     recentPrices: this._priceHistory?.[sym] || null
+ *   });
+ * 
+ *   const effectiveHarvestTrigger = modulated.modulatedHarvestTrigger;
+ *   const effectiveRebalanceTrigger = modulated.modulatedRebalanceTrigger;
+ * 
+ * This single change applies the full power of the new technical alpha layer
+ * (RSI + Bollinger + ROC + Conviction) directly to position management.
  */
 export function getAlphaModulatedTriggers({
   flatHarvestTrigger,
