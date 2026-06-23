@@ -56,7 +56,16 @@ export class TradeHistoryAnalyzer {
         } catch (e) { }
       });
       this.loaded = true;
-      console.log(`   📚 History Loaded: Processed ${this.trades.length} trades.`);
+      // Once-per-process header + per-instance body so the long console dump
+      // doesn't repeat itself across analyzer constructions.
+      TradeHistoryAnalyzer._loadCount = (TradeHistoryAnalyzer._loadCount || 0) + 1;
+      if (TradeHistoryAnalyzer._loadCount === 1) {
+        console.log(`📦 Trade history preload: ${this.trades.length} trades from ${this.historyFile}`);
+        console.log(`   (subsequent analyzer constructions share this preload; each subsequent invocation appends silently.)`);
+      }
+      if (process.env.WORM_VERBOSE_HISTORY === '1') {
+        console.log(`   📚 [analyser #${TradeHistoryAnalyzer._loadCount}] History Loaded: Processed ${this.trades.length} trades.`);
+      }
     } catch (err) { console.error("Error loading history:", err); }
   }
 

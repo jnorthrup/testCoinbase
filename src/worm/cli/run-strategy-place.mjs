@@ -51,7 +51,7 @@ export async function runStrategyPlaceOnce(engine, api, strategyPlace, portfolio
     throw new Error(`Strategy live path did not confirm FILLED for ${candidate.productId}; last state was '${response?.state || 'unknown'}'`);
   }
 
-  const effectivePrice = getEffectivePriceFromResp(response, candidate.previewPrice) || candidate.previewPrice;
+  const effectivePrice = getEffectivePriceFromResp(response, candidate.previewPrice);
   const filledQuantity = getFilledQuantityFromResp(response, candidate.previewQuantity);
   const grossValue = getGrossValueFromResp(response, candidate.previewQuantity, candidate.previewPrice);
   const totalFees = getTotalFeesFromResp(response);

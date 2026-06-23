@@ -13,10 +13,11 @@ import {
   getTotalFeesFromResp,
   getGrossValueFromResp,
 } from '../utils/trade-response.mjs';
-
-const HARVEST_EXCLUDE = ['BTC', 'ETH', 'USDC', 'USDG'];
-const REBALANCE_EXCLUDE = ['BTC', 'ETH', 'USDC', 'USDG'];
-const PRECISION_THRESHOLD = 0.0001;
+import {
+  HARVEST_EXCLUDE,
+  REBALANCE_EXCLUDE,
+  PRECISION_THRESHOLD,
+} from '../config/constants.mjs';
 
 export class TradingEngine {
   constructor(genome, mode = 'SHADOW', initialCapital = 0, initialHoldings = {}) {
@@ -193,5 +194,3 @@ export class TradingEngine {
     return portfolioValue * 0.01;
   }
 }
-
-export { HARVEST_EXCLUDE, REBALANCE_EXCLUDE, PRECISION_THRESHOLD };

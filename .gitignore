@@ -17,7 +17,9 @@ logs/
 liveEngineState.json
 market_data.jsonl
 dreamer_brain_scan.json
+dreamerSimCount.json
 configs/asset_regime_memory.json
+configs/sweep_state_*.json
 
 # environment and credentials
 .env

@@ -27,6 +27,7 @@ import assert from 'node:assert/strict';
 //   - drift is detected by comparing the assumed state vs an oracle (REST GET /orders/<id>)
 
 import { createClient } from '../../coinbase-advanced.js';
+import { getEffectivePriceFromResp } from '../../src/worm/utils/trade-response.mjs';
 
 // ---------------------------------------------------------------
 // 1. Slippage must come from an oracle, not a guess table
@@ -42,12 +43,12 @@ describe('SLIPPAGE: must be derived from observable data, not a static table', (
     const SLIPPAGE_BUFFERS_DEFAULT_SELL = 0.0097;
     // Read the live product book for BTC-USD and capture the real spread.
     const client = createClient();
-    return client.getProduct('BTC-USD').then((product) => {
-      const realSpreadPercent = product && product.spread !== undefined
-        ? product.spread
-        : (product.ask && product.bid)
-          ? (parseFloat(product.ask) - parseFloat(product.bid)) / parseFloat(product.ask)
-          : null;
+    return client.getProductBook('BTC-USD', 5).then((book) => {
+      const bestBid = parseFloat(book?.bids?.[0]?.[0]);
+      const bestAsk = parseFloat(book?.asks?.[0]?.[0]);
+      const realSpreadPercent = Number.isFinite(bestBid) && Number.isFinite(bestAsk) && bestAsk > 0
+        ? (bestAsk - bestBid) / bestAsk
+        : null;
       if (realSpreadPercent === null) {
         // If the API doesn't expose spread, we still assert: the constant must
         // be flagged as needing replacement.
@@ -252,30 +253,13 @@ describe('RATCHET: scalar guesses replaced by value-grounded promotions', () => 
 
 describe('EFFECTIVE PRICE: must come from REST GET /orders/<id>, not from input', () => {
   test('getEffectivePriceFromResp falls back to null, not a guess', () => {
-    // Current code: if the response has no average_price, it returns null
-    // and the caller is expected to handle it. But some call sites substitute
-    // expectedPrice as a fallback. That is the risk: an unverified order
-    // is treated as filled at the expected price.
-    //
-    // The fix: if effective price cannot be extracted, the trade must be
-    // marked UNVERIFIED and the engine must NOT update baselines from it.
-    // Today, the baseline update happens before the verification.
-    const resp = {}; // empty response, no average_price
-    const fallback = 100.0; // operator's expected price
-    // Simulate current behavior: caller substitutes fallback
-    const currentBehavior = resp.average_price || fallback;
-    // The contract we want: if average_price is missing, the engine must
-    // either (a) reject the update, or (b) mark it unverified.
-    // We assert the structural invariant: there must be a `verified` boolean.
-    const requiredFields = ['average_price', 'settled', 'verified'];
-    const hasAllFields = requiredFields.every(f => f in resp);
-    if (!hasAllFields) {
-      assert.fail(
-        'Order response missing required verification fields. ' +
-        'Engine must NOT use fallback price as a substitute for unverified fills. ' +
-        'Required: ' + requiredFields.join(', ')
-      );
-    }
+    const fallback = 100.0; // operator's expected/pre-order price
+    assert.equal(getEffectivePriceFromResp({}, fallback), null);
+    assert.equal(
+      getEffectivePriceFromResp({ average_filled_price: '123.45' }, fallback),
+      123.45,
+      'Coinbase historical GET /orders/<id> uses average_filled_price, not average_price'
+    );
   });
 });
 

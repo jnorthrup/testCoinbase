@@ -29,7 +29,13 @@ class TradeHistoryAnalyzer {
         } catch {}
       });
       this.loaded = true;
-      console.log(`   📚 History Loaded: Processed ${this.trades.length} trades.`);
+      TradeHistoryAnalyzer._loadCount = (TradeHistoryAnalyzer._loadCount || 0) + 1;
+      if (TradeHistoryAnalyzer._loadCount === 1) {
+        console.log(`📦 Trade history preload: ${this.trades.length} trades from ${this.historyFile}`);
+      }
+      if (process.env.WORM_VERBOSE_HISTORY === '1') {
+        console.log(`   📚 [analyser #${TradeHistoryAnalyzer._loadCount}] History Loaded: Processed ${this.trades.length} trades.`);
+      }
     } catch (err) {
       console.error('Error loading history:', err);
     }

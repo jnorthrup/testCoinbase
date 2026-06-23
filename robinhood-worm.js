@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import os from 'os';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
+import { createWalletFacade } from './src/worm/api/wallet-facade.mjs';
 import { createClient, buildMinOrderQtyMap, PERP_EXCLUDE, ETF_EXCLUDE, INDEX_EXCLUDE } from './coinbase-advanced.js';
 import {
   minIncrementMap,
@@ -260,22 +261,27 @@ async function mainLoop() {
 
   let rh;
   try {
-    rh = new CoinbaseWormAPI({ readOnly: paperMode || readOnly, previewOnly: previewMode });
-    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : paperMode ? ' [PAPER]' : readOnly ? ' [READ-ONLY]' : '';
+    const baseCoinbaseApi = new CoinbaseWormAPI({ readOnly, previewOnly: previewMode });
+    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : paperMode ? ' [PAPER-FACADE]' : readOnly ? ' [READ-ONLY-FACADE]' : '';
+    rh = createWalletFacade(baseCoinbaseApi, {
+      forceSimulated: paperMode,
+      modeLabel: paperMode ? 'paper' : readOnly ? 'read-only' : 'live',
+      startCapital: 10000,
+    });
     console.log(`🔑 Coinbase API Initialized${modeLabel}.`);
   }
   catch (error) { console.error("❌ FATAL: API initialization failed:", error.message); rl.close(); return; }
 
   // --- Initialize Engine ---
-  const engineMode = paperMode ? 'SHADOW' : 'LIVE';
+  // Engine is live-action shaped in every runtime. `--paper` explicitly selects
+  // the simulated wallet facade; live/read-only exceptions do not switch modes.
+  const engineMode = 'live';
   liveEngine = new TradingEngine(defaultGenome, engineMode);
 
   // Load State (for genome, promotion thresholds, etc. — applies to both modes)
   const { loadedBaselines, loadedTrailingState, loadedLastActionTimestamps, loadedGenome, loadedData, loadedAssetSourceTimeframe } = loadState();
   if (loadedData) {
-    if (!paperMode) {
-      liveEngine.loadPersistedState(loadedData);
-    }
+    liveEngine.loadPersistedState(loadedData);
     // User requested timeframe colors to start white and only colorize on new promotions this session.
     // We no longer restore assetSourceTimeframe on boot.
     if (loadedData.overflowTarget) {
@@ -283,21 +289,26 @@ async function mainLoop() {
       console.log(`🎯 [Worm Config] Restored dynamic overflow target: ${SNOWBALL_CONFIG.OVERFLOW_TARGET}`);
     }
   }
-  // Paper mode initialization (runs regardless of loadedData)
-  if (paperMode) {
-    // Paper mode: use simulated empty portfolio with $10,000 cash
-    // Override the API calls to return empty holdings for pure simulation
-    const startCapital = 10000; // $10,000 simulated
-    liveEngine.cashBalance = startCapital;
-    liveEngine.initialCapital = startCapital;
-    liveEngine.peakTotalValue = startCapital;
-    console.log(`📄 Paper Trading Mode: Simulated capital $${startCapital.toFixed(2)} (empty portfolio)`);
-    
-    // Override rh.getBalance and rh.getHoldings for paper mode
-    const originalGetBalance = rh.getBalance.bind(rh);
-    const originalGetHoldings = rh.getHoldings.bind(rh);
-    rh.getBalance = async () => liveEngine.cashBalance;
-    rh.getHoldings = async () => [];
+  // Paper is a wallet-facade selection. Coinbase market-data reads remain live;
+  // portfolio/order state is simulated by the facade and may be seeded from
+  // persisted engine state when present.
+  if (paperMode && typeof rh.seedSimulationFromState === 'function') {
+    // Only use loaded cash if it's actually > 0 — otherwise fall back to seed capital
+    const loadedCash = loadedData?.cashBalance;
+    const hasValidCash = Number.isFinite(loadedCash) && loadedCash > 0;
+    rh.seedSimulationFromState({
+      cashBalance: hasValidCash ? loadedCash : undefined,
+      holdings: hasValidCash ? loadedData?.holdings : undefined,  // only adopt holdings if cash is valid
+      fallbackCash: 10000,
+    });
+    const simSnapshot = rh.snapshot?.();
+    if (simSnapshot) {
+      liveEngine.cashBalance = simSnapshot.cashBalance;
+      liveEngine.holdings = simSnapshot.holdings;
+      if (liveEngine.initialCapital <= 0 && simSnapshot.cashBalance > 0) liveEngine.initialCapital = simSnapshot.cashBalance;
+      if (liveEngine.peakTotalValue <= 0 && simSnapshot.cashBalance > 0) liveEngine.peakTotalValue = simSnapshot.cashBalance;
+      console.log(`📄 Wallet facade active: simulated orders/portfolio, live Coinbase market data. Cash $${simSnapshot.cashBalance.toFixed(2)}.`);
+    }
   }
   if (loadedGenome) {
     // Merge loaded genome with defaults, preserving overrides
@@ -873,57 +884,24 @@ async function mainLoop() {
     let anyTradesThisCycle = false;
     let stateChanged = false;
 
-    // Fetch Balance, Holdings, Quotes (Unchanged)
-    let cashBalance = 0; try { cashBalance = await rh.getBalance(); console.log(`💰 Available Cash Balance: $${cashBalance.toFixed(2)}`); } catch (err) { console.error("❌ FATAL: Could not fetch balance:", err.message); rl.close(); return; }
+    // Fetch Balance, Holdings, Quotes through the wallet facade. Coinbase market
+    // reads stay live; portfolio/order state may be simulated when --paper was
+    // selected or Coinbase rejected trade scope on a read-only key.
+    let cashBalance = 0; try { cashBalance = await rh.getBalance(); liveEngine.cashBalance = cashBalance; console.log(`💰 Available Cash Balance: $${cashBalance.toFixed(2)}`); } catch (err) { console.error("❌ FATAL: Could not fetch balance:", err.message); rl.close(); return; }
     let holdings = [];
     let holdingDetails = {};
     let codes = [];
     let rhPrices = {};
 
-    if (paperMode) {
-      // Paper mode: build holdings from engine's simulated state
-      cashBalance = liveEngine.cashBalance;
-      console.log(`💰 Available Cash Balance: $${cashBalance.toFixed(2)}`);
-      
-      for (const [sym, details] of Object.entries(liveEngine.holdings)) {
-        // Handle both formats: {rawQuantity: qty} or plain qty
-        const qty = (typeof details === 'object' && details !== null) 
-          ? (details.rawQuantity || 0) 
-          : (details || 0);
-        if (qty > 0) {
-          const price = liveEngine.lastCyclePrices[sym] || (await rh.getQuotes([sym]))?.[sym];
-          if (price && price > 0) {
-            holdings.push({ asset_code: sym, total_quantity: qty.toString() });
-            holdingDetails[sym] = { rawQuantity: qty };
-            codes.push(sym);
-          }
-        }
-      }
-      if (codes.length > 0) {
-        console.log(`📊 Holdings: ${codes.join(', ')}`);
-        // WS: subscribe new symbols (no-op for already-subscribed), seed candles
-        await rh.startWS(codes);
-        // Price step: WS cache first, REST bulk only for stale/missing
-        const wsPrices = rh.getWsPriceMap(codes);
-        const missing  = codes.filter(s => !wsPrices[s]);
-        const restPrices = missing.length > 0 ? await rh.getQuotes(missing) : {};
-        rhPrices = { ...wsPrices, ...restPrices };
-      } else {
-        console.log("ℹ️ No crypto holdings found.");
-        console.log("ℹ️ Skipping quote fetch.");
-      }
-    } else {
-      // Live mode: fetch from API
-      try { holdings = await rh.getHoldings(); if (holdings.length === 0) console.log("ℹ️ No crypto holdings found."); } catch (err) { console.error("❌ FATAL: Could not fetch holdings:", err.message); rl.close(); return; }
-      if (holdings.length > 0) { holdings.forEach(h => { const code = h.asset_code; const qty = parseFloat(h.total_quantity) || 0; const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10; if (code && qty > minQtyThreshold) { if (!holdingDetails[code]) { holdingDetails[code] = { rawQuantity: 0 }; codes.push(code); } holdingDetails[code].rawQuantity += qty; } }); if (codes.length > 0) console.log(`📊 Holdings: ${codes.join(', ')}`); else console.log("ℹ️ No significant crypto holdings found after filtering."); }
-      if (codes.length > 0) { try {
-        await rh.startWS(codes);
-        const wsPrices2  = rh.getWsPriceMap(codes);
-        const missing2   = codes.filter(s => !wsPrices2[s]);
-        const restPrices2 = missing2.length > 0 ? await rh.getQuotes(missing2) : {};
-        rhPrices = { ...wsPrices2, ...restPrices2 };
-      } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
-    }
+    try { holdings = await rh.getHoldings(); if (holdings.length === 0) console.log("ℹ️ No crypto holdings found."); } catch (err) { console.error("❌ FATAL: Could not fetch holdings:", err.message); rl.close(); return; }
+    if (holdings.length > 0) { holdings.forEach(h => { const code = h.asset_code; const qty = parseFloat(h.total_quantity) || 0; const minQtyThreshold = minIncrementMap[code] ? (minIncrementMap[code] / 10) : 1e-10; if (code && qty > minQtyThreshold) { if (!holdingDetails[code]) { holdingDetails[code] = { rawQuantity: 0 }; codes.push(code); } holdingDetails[code].rawQuantity += qty; } }); if (codes.length > 0) console.log(`📊 Holdings: ${codes.join(', ')}`); else console.log("ℹ️ No significant crypto holdings found after filtering."); }
+    if (codes.length > 0) { try {
+      await rh.startWS(codes);
+      const wsPrices = rh.getWsPriceMap(codes);
+      const missing = codes.filter(s => !wsPrices[s]);
+      const restPrices = missing.length > 0 ? await rh.getQuotes(missing) : {};
+      rhPrices = { ...wsPrices, ...restPrices };
+    } catch (err) { console.error("❌ FATAL: Could not fetch quotes:", err.message); rl.close(); return; } } else { console.log("ℹ️ Skipping quote fetch."); }
 
     // Calculate Portfolio Summary & Initialize/Verify Baselines & State (Unchanged)
     let totalHoldingsValue = 0; const portfolioSummary = []; const currentSymbols = new Set(); let baselinesVerifiedOrSetThisCycle = false;
@@ -968,9 +946,11 @@ async function mainLoop() {
       appendMarketData(Date.now(), portfolioSummary);
     }
 
-    // Paper mode: initialize as ready to trade even with empty portfolio
-    if (!initialized && paperMode && liveEngine.cashBalance > 0) {
-      console.log("✅ Paper mode initialized: ready to spawn assets.");
+    const walletIsSimulated = Boolean(rh?.isSimulatedWallet?.());
+
+    // Simulated wallet facade can trade from cash even with no starting holdings.
+    if (!initialized && walletIsSimulated && liveEngine.cashBalance > 0) {
+      console.log("✅ Simulated wallet facade initialized: ready to spawn assets.");
       initialized = true;
       if (stateChanged) { saveState(); stateChanged = false; }
     }
@@ -1245,10 +1225,9 @@ async function mainLoop() {
       break;
     }
 
-    // Paper mode: build simulated portfolioSummary from engine's internal state
     // --- Auto Trading Logic ---
-    // In paper mode, allow engine to run with empty portfolio (spawner needs cash)
-    const shouldRunEngine = paperMode 
+    // Simulated wallet facade may run with empty holdings (spawner needs cash).
+    const shouldRunEngine = walletIsSimulated
       ? (liveEngine.cashBalance > 0 && initialized)
       : (portfolioSummary.length > 0 && initialized);
       
@@ -1353,8 +1332,8 @@ async function mainLoop() {
 
 
     // --- Periodic & Immediate State Save ---
-    // Skip state persistence in paper mode (simulated only)
-    if (!paperMode && (stateChanged || (startTime - lastStateSaveTime >= STATE_SAVE_INTERVAL))) {
+    // Persist facade-backed simulated state too; --paper is no longer a throwaway agent.
+    if (stateChanged || (startTime - lastStateSaveTime >= STATE_SAVE_INTERVAL)) {
       saveEngineState();
       stateChanged = false;
       lastStateSaveTime = startTime;

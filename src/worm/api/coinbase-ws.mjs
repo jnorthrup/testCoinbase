@@ -56,6 +56,11 @@ class CoinbaseWS {
     this.maxReconnectAttempts = options.maxReconnectAttempts || 10;
     this.baseReconnectDelay = options.reconnectDelay || 2000;
     this.heartbeatInterval = null;
+    this._manualDisconnect = false;
+    this._sendQueue = [];
+    this._drainingSendQueue = false;
+    this._nextControlSendAt = 0;
+    this.CONTROL_MIN_INTERVAL_MS = 125; // Coinbase WS control limit: 8 messages/sec
 
     this._pendingSubs = []; // { channel, product_ids } queued before connect
     this._subscribed  = new Map(); // channel -> Set(product_id)
@@ -66,12 +71,19 @@ class CoinbaseWS {
     // candleCache: `${productId}:${granularity}` -> candle[]
     // Each candle: { start, open, high, low, close, volume }
     this.candleCache = new Map();
+    // priceHistory: sym -> [{ts, price, bid, ask, volume?}, ...] bounded ringbuffer.
+    // Used by getShortTermMovers() to compute realized return over lookbackMs.
+    // Bounded to ~5min of ticks at ~1Hz; entries older than PRICE_HISTORY_TTL are trimmed.
+    this.priceHistory = {};
+    this.PRICE_HISTORY_TTL = 10 * 60 * 1000;       // 10 minutes
+    this.PRICE_HISTORY_MAX_ENTRIES = 1024;         // per-symbol cap
   }
 
   // ── Connection ─────────────────────────────────────────────────────────────
 
   connect() {
     return new Promise((resolve, reject) => {
+      this._manualDisconnect = false;
       this.ws = new WebSocket(WS_URL);
 
       this.ws.on('open', () => {
@@ -97,12 +109,14 @@ class CoinbaseWS {
         console.log(`[WS] Disconnected (${code}): ${reason}`);
         this.isConnected = false;
         this._stopHeartbeat();
+        if (this._manualDisconnect) return;
         this._scheduleReconnect();
       });
     });
   }
 
   disconnect() {
+    this._manualDisconnect = true;
     this._stopHeartbeat();
     if (this.ws) { this.ws.close(); this.ws = null; }
     this.isConnected = false;
@@ -111,23 +125,21 @@ class CoinbaseWS {
   // ── Subscriptions ───────────────────────────────────────────────────────────
 
   // Subscribe to ticker_batch for real-time prices (main use case).
-  // Also seeds candleCache from REST for each new symbol.
+  // Note: ticker_batch is a PUBLIC channel — no JWT required.
+  // We skip candle seeding since it requires authenticated endpoints.
   async subscribe(channel, symbols) {
     const ids = (Array.isArray(symbols) ? symbols : [symbols]).map(normalizeProductId);
     if (ids.length === 0) return;
 
-    // Seed candle cache from REST before subscribing (so WS updates extend history)
-    if (channel === WS_CHANNELS.TICKER_BATCH || channel === WS_CHANNELS.CANDLES) {
-      await this._seedCandles(ids);
-    }
+    // Skip candle seeding — candles endpoint requires marketdata scope (authenticated).
+    // WS ticker_batch provides real-time prices without any auth.
 
     const msg = { type: 'subscribe', channel, product_ids: ids };
-    if (this.keyName && this.keySecret) {
-      msg.jwt = buildJwt(this.keyName, this.keySecret);
-    }
+    // Note: we intentionally DON'T add JWT here — ticker_batch is public.
+    // Only add JWT for private channels if needed.
 
     if (this.isConnected) {
-      this.ws.send(JSON.stringify(msg));
+      await this._sendControl(msg);
     } else {
       this._pendingSubs.push(msg);
     }
@@ -145,7 +157,7 @@ class CoinbaseWS {
     const toDrop = [...current].filter(id => !newIds.has(id));
 
     if (toDrop.length > 0 && this.isConnected) {
-      this.ws.send(JSON.stringify({ type: 'unsubscribe', channel, product_ids: toDrop }));
+      await this._sendControl({ type: 'unsubscribe', channel, product_ids: toDrop });
       toDrop.forEach(id => current.delete(id));
     }
     if (toAdd.length > 0) {
@@ -205,6 +217,14 @@ class CoinbaseWS {
           const ask   = parseFloat(t.best_ask  || t.ask  || 0);
           if (price > 0) {
             this.priceCache[sym] = { price, bid, ask, ts: Date.now() };
+            // Append to per-symbol price-history ringbuffer for short-term momentum
+            if (!this.priceHistory[sym]) this.priceHistory[sym] = [];
+            const arr = this.priceHistory[sym];
+            const now = Date.now();
+            arr.push({ ts: now, price, bid, ask });
+            // bound: drop entries older than TTL OR keep size under cap
+            const cutoff = now - this.PRICE_HISTORY_TTL;
+            while (arr.length > 0 && (arr[0].ts < cutoff || arr.length > this.PRICE_HISTORY_MAX_ENTRIES)) arr.shift();
           }
         }
       }
@@ -282,9 +302,37 @@ class CoinbaseWS {
   _flushPending() {
     for (const msg of this._pendingSubs) {
       if (this.keyName && this.keySecret) msg.jwt = buildJwt(this.keyName, this.keySecret);
-      this.ws.send(JSON.stringify(msg));
+      this._sendControl(msg).catch(() => {});
     }
     this._pendingSubs = [];
+  }
+
+  _sendControl(msg) {
+    return new Promise((resolve, reject) => {
+      this._sendQueue.push({ msg, resolve, reject });
+      this._drainSendQueue().catch(() => {});
+    });
+  }
+
+  async _drainSendQueue() {
+    if (this._drainingSendQueue) return;
+    this._drainingSendQueue = true;
+    try {
+      while (this._sendQueue.length > 0) {
+        const item = this._sendQueue.shift();
+        const waitMs = Math.max(0, this._nextControlSendAt - Date.now());
+        if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          item.reject(new Error('WebSocket is not open'));
+          continue;
+        }
+        this.ws.send(JSON.stringify(item.msg));
+        this._nextControlSendAt = Date.now() + this.CONTROL_MIN_INTERVAL_MS;
+        item.resolve();
+      }
+    } finally {
+      this._drainingSendQueue = false;
+    }
   }
 
   _startHeartbeat() {
@@ -316,7 +364,7 @@ class CoinbaseWS {
         if (ids.size === 0) continue;
         const msg = { type: 'subscribe', channel, product_ids: [...ids] };
         if (this.keyName && this.keySecret) msg.jwt = buildJwt(this.keyName, this.keySecret);
-        this.ws.send(JSON.stringify(msg));
+        this._sendControl(msg).catch(() => {});
       }
     }).catch(() => {}), delay);
   }

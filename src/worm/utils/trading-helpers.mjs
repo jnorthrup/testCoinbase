@@ -76,10 +76,11 @@ function parseOptionalNumber(value) {
 }
 
 function getEffectivePriceFromResp(resp, fallbackPrice) {
-  const priceStr = resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price || fallbackPrice?.toString();
+  // No silent fallback — return null when fill price absent; let caller decide.
+  const priceStr = resp?.average_filled_price || resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price;
   if (priceStr === undefined || priceStr === null) return null;
   const priceNum = parseFloat(priceStr);
-  return !Number.isNaN(priceNum) && priceNum > 0 ? priceNum : null;
+  return !isNaN(priceNum) && priceNum > 0 ? priceNum : null;
 }
 
 function getFilledQuantityFromResp(resp, fallbackQuantity = null) {

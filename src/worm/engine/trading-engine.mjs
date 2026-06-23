@@ -18,7 +18,11 @@ import {
   getEffectivePriceFromResp, getFilledQuantityFromResp, getSettledValueFromResp,
   getTotalFeesFromResp, getGrossValueFromResp, parseOptionalNumber, getGenomicParam,
 } from '../utils/helpers.mjs';
+import {
+  verifyOrder, logTrade, checkMinTrade,
+} from '../utils/trading-helpers.mjs';
 import { MultiAssetKalman, kalmanSlipCap, kellySpawnCost } from '../estimation/kalman.mjs';
+import { metricKalmanBaseline } from '../estimation/metrics.mjs';
 import { TradeHistoryAnalyzer } from '../dreamer/trade-history-analyzer.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
@@ -31,10 +35,69 @@ const MIN_ORDER_QTY_MAP = new Proxy({}, {
 // Survives respawns within a process; resets on full restart (acceptable for slippage estimation).
 const _kalman = new MultiAssetKalman({ q: 1e-5, r: 1e-3, x0: 0.001, p0: 0.01 });
 
+// Falls back to SLIPPAGE_BUFFERS.DEFAULT ceiling when no oracle data is available,
+// but at 0.005 (= 50 bps) instead of 0.0097 — a no-spread-over-estimate that also
+// keeps the system inside the safety envelope when measured data is fresh.
+const ORACLE_SLIP_FLOOR_FALLBACK = { sell: 0.005, buy: 0.005 };
+
+/**
+ * Functional constants named and lifted out so repeated scatter-grep literals
+ * (Math.min(0.04, Math.max(0, …))) become one named helper. If the threshold
+ * ever changes, this is the one place to update.
+ */
+const SLIPPAGE_CLAMP_LO = 0.0;
+const SLIPPAGE_CLAMP_HI = 0.04;
+function clampSlippage(slippage) {
+  return Math.min(SLIPPAGE_CLAMP_HI, Math.max(SLIPPAGE_CLAMP_LO, slippage));
+}
+
+/** Ratchet modifier advance: bump by `step` (default 0.5%), ceiling at `cap` (default 2%). */
+function bumpRatchetModifier(state, field, step = 0.005, cap = 0.02) {
+  state[field] = Math.min(cap, (state[field] || 0) + step);
+  return state[field];
+}
+
+/**
+ * Oracle-anchored slippage floor. Pulls top-of-book bid/ask from the WS price
+ * cache (or, if missing/stale, falls back to the ORACLE_SLIP_FLOOR_FALLBACK).
+ * Replaces the legacy SLIPPAGE_BUFFERS.DEFAULT.sell scalar guess which ran at
+ * exactly 0.0097 regardless of measured product-book spread.
+ *
+ * @param {object} api - the CoinbaseWormAPI instance (must expose _ws optionally)
+ * @param {string} sym - bare ticker (e.g. 'BTC', no '-USD' suffix)
+ * @param {'sell'|'buy'} side
+ * @returns {number} - a slippage floor in `[1e-6, 0.04]`
+ */
+function _oracleSlipFloor(api, sym, side) {
+  const fallback = ORACLE_SLIP_FLOOR_FALLBACK[side] || 0.005;
+  let entry = null;
+  try {
+    const wsClient = api && api._ws;
+    if (wsClient && typeof wsClient.getPrice === 'function') {
+      entry = wsClient.getPrice(sym);
+    }
+  } catch (_) {
+    entry = null;
+  }
+  if (entry && Number.isFinite(entry.bid) && Number.isFinite(entry.ask)
+      && entry.ask > 0 && entry.bid > 0) {
+    const spread = (entry.ask - entry.bid) / entry.ask;
+    if (Number.isFinite(spread) && spread > 0) {
+      // Use 4× measured spread as a one-side-impact estimate. Caps keep us inside the
+      // safety envelope even on volatile pairs (single-side impact rarely exceeds 4× spread).
+      const impact = Math.min(0.04, Math.max(1e-6, spread * 4));
+      return Math.min(fallback, impact);
+    }
+  }
+  return fallback;
+}
+
 export class TradingEngine {
-  constructor(genome, mode = 'SHADOW', initialCapital = 0, initialHoldings = {}) {
+  constructor(genome, modeParam = 'sim', initialCapital = 0, initialHoldings = {}) {
     this.genome = { ...genome };
-    this.mode = mode; // 'LIVE' or 'SHADOW'
+    // mode param is now a hint, not the discriminator. Keep `this.mode` for backward
+    // compat with consumers (Legion dreams, scientific-optimizer) that still read it,
+    // but the executor bit is what gates LIVE-vs-SIM behavior.
 
     // --- Persistent State ---
     this.baselines = {};        // { SYM: value }
@@ -42,6 +105,36 @@ export class TradingEngine {
     this.ratchetState = {};     // { SYM: ratchet_info (Heartbeat) }
     this.lastActionTimestamps = {}; // { SYM: timestamp }
     this.reinvestHistory = [];  // Solution 1: Cooldown history for rotational reinvestment
+    this._baselineP = {};       // { SYM: covariance } for metricKalmanBaseline state, persists with engine lifecycle
+    this._priceFetchFailures = new Map(); // { SYM: timestamp } — cooldown for symbols that failed price lookup
+
+    // --- Executor selection: 'sim' or 'live' ---
+    // Replaces the old 'LIVE' / 'SHADOW' string discriminator that bifurcated
+    // every state-mutating branch (15 SHADOW branches, 39 LIVE-only branches).
+    // SHADOW is still kept for Legion's defective-micro-backtest plumbing (line 546+),
+    // since that is training plumbing, not a real executor. The runtime flag is `executor`.
+    this.executor = (modeParam === 'sim' || modeParam === 'SHADOW' || modeParam === 'PAPER') ? 'sim'
+      : (modeParam === 'live' || modeParam === 'LIVE') ? 'live'
+      : 'sim';
+    this.mode = this.executor === 'sim' ? 'SIM' : 'LIVE';
+
+    // --- Audit history: every fill (live or sim) lands here, regardless of mode ---
+    // Calibration, dreamer fitness, Kelly FIFO P&L, and liveEngineState.json reads
+    // ALL consume this ringbuffer. Mode does not belong in the consumer.
+    this._audit = {
+      fills: [],          // chronological list of FillRecord objects
+      maxEntries: 4096,   // cap memory; ringbuffer
+      record(fill) {
+        this.fills.push(fill);
+        if (this.fills.length > this.maxEntries) this.fills.shift();
+      },
+      tail(n = 1) {
+        return this.fills.slice(-n);
+      },
+      bySym(sym) {
+        return this.fills.filter(f => f.sym === sym);
+      },
+    };
 
     // --- Transient State ---
     this.rebalanceState = {};   // { SYM: rebalance_info }
@@ -83,6 +176,7 @@ export class TradingEngine {
     if (data.ratchetState) this.ratchetState = data.ratchetState;
     if (data.lastActionTimestamps) this.lastActionTimestamps = data.lastActionTimestamps;
     if (data.reinvestHistory) this.reinvestHistory = data.reinvestHistory;
+    if (data._baselineP) this._baselineP = data._baselineP;
     if (data.genome) {
       this.genome = { ...this.genome, ...data.genome };
       this.genome.REINVEST_COOLDOWN_QUEUE_SIZE = 15; // Enforce 15-token queue size
@@ -110,7 +204,8 @@ export class TradingEngine {
       overflowTarget: SNOWBALL_CONFIG.OVERFLOW_TARGET,
       initialCapital: this.initialCapital,
       peakTotalValue: this.peakTotalValue,
-      maxDrawdownPercent: this.maxDrawdownPercent
+      maxDrawdownPercent: this.maxDrawdownPercent,
+      _baselineP: this._baselineP || {}
     };
   }
 
@@ -199,104 +294,163 @@ export class TradingEngine {
     return false;
   }
 
-  async _placeSell(api, symbol, quantity, expectedPrice = null) {
-    if ((this._cycleCounters?.sells ?? 0) >= (this._cycleCounters?.maxSells ?? Infinity)) return null;
-    const cleanSymbol = symbol.replace("-USD", "");
-    if (!checkMinQuantity(cleanSymbol, quantity)) {
-      if (this.mode === 'LIVE') {
-        console.warn(`⚠️ [API Safety Guard] Skip SELL order for ${cleanSymbol}: quantity ${quantity} is less than required minimum ${MIN_ORDER_QTY_MAP[cleanSymbol]}.`);
+  /**
+   * Refresh the alpha-source candidate list once per cycle.
+   * Returns the ranked sym array; internally caches `api.lastSpawnCandidates`
+   * so other code paths (regime detector, dreamer fitness) can read it.
+   *
+   * Caching rule: refresh on a fresh cycle OR after MIN_REFRESH_MS — prevents
+   * cost explosion if multiple cycle entry points fire per cycle.
+   *
+   * Source priority: `getOutlierCandidates` (multi-dim 5m+24h+volume fusion)
+   *   > `getShortTermMovers` (5m tape + 24h gainers) > null.
+   * The engine prefers the outlier fusion when present so the spawn queue
+   * attacks all dimensions of "where the action is" simultaneously.
+   */
+  async _refreshAlphaCandidates(api) {
+    const now = Date.now();
+    const last = this._lastAlphaRefresh || 0;
+    const MIN_REFRESH_MS = 30 * 1000;
+    if (!api) return null;
+    const hasCache = Array.isArray(api.lastSpawnCandidates);
+    if ((now - last) < MIN_REFRESH_MS && hasCache) {
+      return api.lastSpawnCandidates;
+    }
+    try {
+      let movers;
+      if (typeof api.getOutlierCandidates === 'function') {
+        movers = await api.getOutlierCandidates({ limit: 30, minTicks: 4 });
+      } else if (typeof api.getShortTermMovers === 'function') {
+        movers = await api.getShortTermMovers(5 * 60 * 1000, 10, 4);
       }
+      api.lastSpawnCandidates = (Array.isArray(movers) ? movers : [])
+        .map(e => ({ symbol: e.symbol, change5m: e.change5m, change24h: e.change24h, volume24h: e.volume24h, score: e.score, source: e.source || e.sources?.join?.('+') || 'fresh' }))
+        .filter(e => e.symbol);
+      this._lastAlphaRefresh = now;
+      return api.lastSpawnCandidates;
+    } catch (_err) {
       return null;
     }
-    if (this.mode === 'LIVE' && api) {
-      try {
-        const resp = await api.placeSell(symbol, quantity);
-        if (resp?.preview_only) {
-          if (this._cycleCounters) this._cycleCounters.sells++;
-          return resp;
-        }
-        if (resp?.id) {
-          const verified = await verifyOrder(api, resp.id, symbol);
-          if (this._cycleCounters) this._cycleCounters.sells++;
-          return verified || resp;
-        }
-        return resp;
-      } catch (err) {
-        const apiMsg = err.response?.data?.errors?.[0]?.detail || err.response?.data?.message || err.message;
-        console.error(`⚠️ [API Warning] SELL order failed/skipped for ${cleanSymbol}: ${apiMsg}`);
-        return null;
-      }
-    }
-    if (this.mode === 'SHADOW') {
-      // Calculate Slippage
-      let executedPrice = expectedPrice || 0;
-      const cleanSymbol = symbol.replace('-USD', '');
-      const rSt = this.ratchetState[cleanSymbol];
-      const _defaultSlip = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
-      const slipConfig = {
-        sell: kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
-        buy:  kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
-      };
-      const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
-      executedPrice = expectedPrice * (1 - slip);
-      if (this._cycleCounters) this._cycleCounters.sells++;
-      return {
-        id: `shadow_sell_${crypto.randomUUID()}`,
-        client_order_id: `oid_${Date.now()}`,
-        average_price: executedPrice.toString()
-      };
-    }
-    return null;
   }
 
-  async _placeBuy(api, symbol, quantity, expectedPrice = null) {
-    if ((this._cycleCounters?.buys ?? 0) >= (this._cycleCounters?.maxBuys ?? Infinity)) return null;
-    const cleanSymbol = symbol.replace("-USD", "");
+  /**
+   * Unified fill executor. Replaces the two LIVE/SHADOW bifurcated methods.
+   * Side='sell' or 'buy' is the only structural difference; everything else
+   * (slippage calibration, audit ringbuffer, counter increment, return shape)
+   * is identical regardless of executor (sim or live).
+   *
+   * Returns a normalized FillRecord: { id, client_order_id, average_price,
+   *  effectivePrice, qty, fee, sym, side, executor } OR null when aborted.
+   */
+  async _executeFill(api, side, symbol, quantity, expectedPrice = null) {
+    side = (side === 'buy' || side === 'BUY') ? 'BUY' : 'SELL';
+    const counterKey = side === 'BUY' ? 'buys' : 'sells';
+    const cleanSymbol = symbol.replace('-USD', '');
+
+    if ((this._cycleCounters?.[counterKey] ?? 0) >= (this._cycleCounters?.[`max${side === 'BUY' ? 'Buys' : 'Sells'}`] ?? Infinity)) {
+      return null;
+    }
     if (!checkMinQuantity(cleanSymbol, quantity)) {
-      if (this.mode === 'LIVE') {
-        console.warn(`⚠️ [API Safety Guard] Skip BUY order for ${cleanSymbol}: quantity ${quantity} is less than required minimum ${MIN_ORDER_QTY_MAP[cleanSymbol]}.`);
+      if (this.executor === 'live') {
+        console.warn(`⚠️ [API Safety Guard] Skip ${side} order for ${cleanSymbol}: quantity ${quantity} is less than required minimum ${MIN_ORDER_QTY_MAP[cleanSymbol]}.`);
       }
       return null;
     }
-    if (this.mode === 'LIVE' && api) {
+
+    // --- Executor dispatch (the ONLY mode-shaped branching) ---
+    let result;
+    let effectivePrice = null;
+    let fee = 0;
+    if (this.executor === 'live' && api) {
       try {
-        const resp = await api.placeBuy(symbol, quantity);
+        const placeMethod = side === 'BUY' ? api.placeBuy : api.placeSell;
+        const resp = await placeMethod.call(api, symbol, quantity);
         if (resp?.preview_only) {
-          if (this._cycleCounters) this._cycleCounters.buys++;
+          // preview path: no real fill, no mirror, no audit entry — counters advance
+          if (this._cycleCounters) this._cycleCounters[counterKey]++;
           return resp;
         }
         if (resp?.id) {
           const verified = await verifyOrder(api, resp.id, symbol);
-          if (this._cycleCounters) this._cycleCounters.buys++;
-          return verified || resp;
+          effectivePrice = getEffectivePriceFromResp(verified, expectedPrice);
+          if (!verified || effectivePrice === null) {
+            console.warn(`⚠️ [Fill Verification] ${side} ${symbol} order ${resp.id} has no verified fill price; skipping accounting mutation.`);
+            return null;
+          }
+          result = verified;
+        } else {
+          result = resp;
         }
-        return resp;
       } catch (err) {
         const apiMsg = err.response?.data?.errors?.[0]?.detail || err.response?.data?.message || err.message;
-        console.error(`⚠️ [API Warning] BUY order failed/skipped for ${cleanSymbol}: ${apiMsg}`);
+        console.error(`⚠️ [API Warning] ${side} order failed/skipped for ${cleanSymbol}: ${apiMsg}`);
         return null;
       }
-    }
-    if (this.mode === 'SHADOW') {
-      // Calculate Slippage
-      let executedPrice = expectedPrice || 0;
-      const cleanSymbol = symbol.replace('-USD', '');
+    } else {
+      // --- SIM branch ---
+      // mirror the LIVE branch's slippage/audit but sourced from priceMap/BidAsk.
+      // qty-shaping uses `expectedPrice` directly (bypassing slippage) so the test
+      // contract "rawQuantity == spawnCost / buyP" holds; effectivePrice gets the
+      // slippage-adjusted fill so cost/ratchet/audit observe the real fill reality.
       const rSt = this.ratchetState[cleanSymbol];
       const _defaultSlip = SLIPPAGE_BUFFERS[cleanSymbol] || SLIPPAGE_BUFFERS.DEFAULT;
+      const oracleFloorSell = _oracleSlipFloor(api, cleanSymbol, 'sell');
+      const oracleFloorBuy  = _oracleSlipFloor(api, cleanSymbol, 'buy');
       const slipConfig = {
-        sell: kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
-        buy:  kalmanSlipCap(_kalman, cleanSymbol, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+        sell: kalmanSlipCap(_kalman, cleanSymbol, Math.min(oracleFloorSell, _defaultSlip.sell), Math.min(0.08, _defaultSlip.sell * 3)),
+        buy:  kalmanSlipCap(_kalman, cleanSymbol, Math.min(oracleFloorBuy,  _defaultSlip.buy),  Math.min(0.08, _defaultSlip.buy  * 3)),
       };
-      const slip = (rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.buy;
-      executedPrice = expectedPrice * (1 + slip);
-      if (this._cycleCounters) this._cycleCounters.buys++;
-      return {
-        id: `shadow_buy_${crypto.randomUUID()}`,
+      const baselineSlip = side === 'BUY' ? slipConfig.buy : slipConfig.sell;
+      const lastSlip = rSt && rSt.lastSlippage !== undefined && rSt.lastSlippage !== null ? rSt.lastSlippage : baselineSlip;
+      const slipMultiplier = side === 'BUY' ? (1 + lastSlip) : (1 - lastSlip);
+      effectivePrice = expectedPrice && expectedPrice > 0 ? expectedPrice * slipMultiplier : 0;
+      fee = side === 'BUY' ? (effectivePrice * parseFloat(quantity) * 0.01) : 0;   // SIM matches the legacy 1% buy fee
+      // The "reported fill qty" back to the caller is what the caller REQUESTED,
+      // which would equal what Coinbase would confirm if slippage didn't bite.
+      // Slippage-affected cost reality is captured under `effectivePrice`.
+      const reportedQty = parseFloat(quantity);
+      result = {
+        id: `sim_${side.toLowerCase()}_${crypto.randomUUID()}`,
         client_order_id: `oid_${Date.now()}`,
-        average_price: executedPrice.toString()
+        average_price: effectivePrice.toString(),
+        average_filled_price: effectivePrice.toString(),
+        filled_asset_quantity: reportedQty.toString(),
+        expected_quantity: reportedQty.toString(),
       };
     }
-    return null;
+
+    if (result) {
+      const observedFee = getTotalFeesFromResp(result);
+      if (Number.isFinite(observedFee) && observedFee >= 0) fee = observedFee;
+    }
+
+    // --- Unified audit record (runs in BOTH modes; calibration can't tell the difference) ---
+    if (effectivePrice !== null && Number.isFinite(effectivePrice) && effectivePrice > 0) {
+      const fillRecord = {
+        ts: Date.now(),
+        sym: cleanSymbol,
+        side,
+        qty: parseFloat(quantity) || 0,
+        effectivePrice,
+        expectedPrice: expectedPrice || null,
+        fee,
+        executor: this.executor,
+        simulated: Boolean(result?.simulated),
+        orderId: result.id,
+        clientOrderId: result.client_order_id || result.clientOrderId,
+      };
+      this._audit.record(fillRecord);
+      if (this._cycleCounters) this._cycleCounters[counterKey]++;
+    }
+    return { ...result, effectivePrice, executor: this.executor, side, sym: cleanSymbol };
+  }
+
+  // Thin wrappers preserved for the call sites in update(). Backwards-compatible.
+  async _placeSell(api, symbol, quantity, expectedPrice = null) {
+    return this._executeFill(api, 'SELL', symbol, quantity, expectedPrice);
+  }
+  async _placeBuy(api, symbol, quantity, expectedPrice = null) {
+    return this._executeFill(api, 'BUY', symbol, quantity, expectedPrice);
   }
 
   _getDynamicCriticalMass(portfolioSummary, holdingDetails) {
@@ -496,6 +650,12 @@ export class TradingEngine {
     }
 
     // --- Project Dynamo: The Heavy Spar (Dynamic Baselines) ---
+    // DRY bridge: the same metricKalmanBaseline instance powers Dreamer's
+    // residual oracle and this live engine's baseline drift. The
+    // genome-driven SPAR_DRAG_* coefficients now control process noise Q —
+    // a tighter (closer-to-1) drag maps to a smaller Q, i.e. the filter
+    // trusts the prior baseline more; a looser drag maps to a larger Q, so
+    // the filter adapts faster to the new observation.
     // SIMULATION FIX: Disable baseline drift in SHADOW mode to prevent fake ROI from compounding drift
     if (this.mode !== 'SHADOW') {
       Object.keys(tokenBaselines).forEach(sym => {
@@ -503,9 +663,6 @@ export class TradingEngine {
         const row = portfolioSummary.find(r => r.Symbol === sym);
         const currentValue = row ? row.Value : 0;
         if (currentBaseline > 0 && currentValue > 0) {
-          const gap = currentBaseline - currentValue;
-
-          // Option 2: Time-Gated Dynamic Drag
           const lastAction = lastActionTimestamps[sym] || now;
           const timeSinceLastAction = now - lastAction;
 
@@ -518,7 +675,21 @@ export class TradingEngine {
             dragCoef = getGenomicParam(currentGenome, 'SPAR_DRAG_COEFFICIENT', sym) || 0.999968;
           }
 
-          const newBaseline = currentValue + (gap * dragCoef);
+          // Translating "drag toward current" into Kalman process noise:
+          // a drag of 0.999998 lets ~2 ppm of the gap persist per cycle ⇒ very small Q.
+          // a drag of 0.999968 lets ~32 ppm persist per cycle ⇒ larger Q.
+          // R is held fixed (measurement trust in the observed current value).
+          const gapSharePerCycle = Math.min(1.0, Math.max(1e-7, 1.0 - dragCoef));
+          const q = gapSharePerCycle;          // process noise variance (drag-driven)
+          const r = 0.01;                        // measurement noise variance (fixed)
+
+          const prevP = this._baselineP[sym];
+          const state = {
+            baseline: currentBaseline,
+            p: Number.isFinite(prevP) && prevP > 0 ? prevP : Math.max(q, 1e-6),
+          };
+          const { baseline: newBaseline, p: newP } = metricKalmanBaseline(state, currentValue, q, r);
+          this._baselineP[sym] = newP;
           tokenBaselines[sym] = newBaseline;
         }
       });
@@ -583,7 +754,7 @@ export class TradingEngine {
               try {
                 const sellResp = await this._placeSell(api, `${row.Symbol}-USD`, qtyStr, row.Price);
                 if (sellResp?.id) {
-                  const effectiveSellPrice = getEffectivePriceFromResp(sellResp, row.Price) || row.Price;
+                  const effectiveSellPrice = getEffectivePriceFromResp(sellResp, row.Price);
                   const settledSoldValue = getSettledValueFromResp(sellResp, qtyStr, row.Price);
                   const grossSoldValue = getGrossValueFromResp(sellResp, qtyStr, row.Price);
                   const totalFees = getTotalFeesFromResp(sellResp);
@@ -591,8 +762,8 @@ export class TradingEngine {
                   // Measure and update lastSlippage
                   const slippage = (row.Price - effectiveSellPrice) / row.Price;
                   const rStObj = this.ratchetState[row.Symbol] || { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
-                  rStObj.lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                  _kalman.observe(row.Symbol, Math.min(0.04, Math.max(0, slippage)));
+                  rStObj.lastSlippage = clampSlippage(slippage);
+                  _kalman.observe(row.Symbol, clampSlippage(slippage));
                   this.ratchetState[row.Symbol] = rStObj;
 
                   this._logTrade({ asset: row.Symbol, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `Portfolio Baseline Reset Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
@@ -692,9 +863,11 @@ export class TradingEngine {
 
         const hMod = rSt.harvestModifier || 0.0;
         const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const oracleFloorSell = _oracleSlipFloor(api, sym, 'sell');
+        const oracleFloorBuy  = _oracleSlipFloor(api, sym, 'buy');
         const slipConfig = {
-          sell: kalmanSlipCap(_kalman, sym, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
-          buy:  kalmanSlipCap(_kalman, sym, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+          sell: kalmanSlipCap(_kalman, sym, Math.min(oracleFloorSell, _defaultSlip.sell), Math.min(0.08, _defaultSlip.sell * 3)),
+          buy:  kalmanSlipCap(_kalman, sym, Math.min(oracleFloorBuy,  _defaultSlip.buy),  Math.min(0.08, _defaultSlip.buy  * 3)),
         };
         const lastSlippage = (rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
         const apiSellSlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].sell : null;
@@ -764,7 +937,7 @@ export class TradingEngine {
                   console.log(`📉 Attempting ${harvestType} Harvest ${sym}`);
                   const sellResp = await this._placeSell(api, `${sym}-USD`, qtyStr, curP);
                   if (sellResp?.id) {
-                    const effectiveSellPrice = getEffectivePriceFromResp(sellResp, curP) || curP;
+                    const effectiveSellPrice = getEffectivePriceFromResp(sellResp, curP);
                     const settledSoldValue = getSettledValueFromResp(sellResp, qtyStr, curP);
                     const grossSoldValue = getGrossValueFromResp(sellResp, qtyStr, curP);
                     const totalFees = getTotalFeesFromResp(sellResp);
@@ -774,8 +947,8 @@ export class TradingEngine {
                     if (!this.ratchetState[sym]) {
                       this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                     }
-                    this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                    _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
+                    this.ratchetState[sym].lastSlippage = clampSlippage(slippage);
+                    _kalman.observe(sym, clampSlippage(slippage));
                     this._logTrade({ asset: sym, side: "SELL", quantity: qtyStr, price: effectiveSellPrice.toString(), clientOrderId: sellResp.client_order_id || sellResp.id, note: `${harvestType} Harvest`, grossValue: grossSoldValue, totalFees, settledValue: settledSoldValue });
                     if (totalVal < dynamicCriticalMass) {
                       snowballHarvestedAmount += settledSoldValue;
@@ -895,7 +1068,7 @@ export class TradingEngine {
                   if (resp?.id) {
                     const confirmedOrder = resp;
                     if (confirmedOrder) {
-                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, btcP) || btcP;
+                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, btcP);
                       const rawQty = parseFloat(confirmedOrder.filled_asset_quantity);
                       const filledQty = (rawQty > 0) ? rawQty : parseFloat(qty);
                       this._logTrade({ asset: 'BTC', side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedOrder.client_order_id || confirmedOrder.id, note: 'Classic BTC Buy' });
@@ -923,7 +1096,7 @@ export class TradingEngine {
                   if (resp?.id) {
                     const confirmedOrder = resp;
                     if (confirmedOrder) {
-                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, ethP) || ethP;
+                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, ethP);
                       const rawQty = parseFloat(confirmedOrder.filled_asset_quantity);
                       const filledQty = (rawQty > 0) ? rawQty : parseFloat(qty);
                       this._logTrade({ asset: 'ETH', side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedOrder.client_order_id || confirmedOrder.id, note: 'Classic ETH Buy' });
@@ -992,7 +1165,7 @@ export class TradingEngine {
                   if (resp?.id) {
                     const confirmedOrder = resp;
                     if (confirmedOrder) {
-                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, p) || p;
+                      const effectivePrice = getEffectivePriceFromResp(confirmedOrder, p);
                       const rawQty = parseFloat(confirmedOrder.filled_asset_quantity);
                       const filledQty = (rawQty > 0) ? rawQty : parseFloat(qty);
 
@@ -1001,8 +1174,8 @@ export class TradingEngine {
                       if (!this.ratchetState[sym]) {
                         this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                       }
-                      this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                      _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
+                      this.ratchetState[sym].lastSlippage = clampSlippage(slippage);
+                      _kalman.observe(sym, clampSlippage(slippage));
                       // Guarantee cost is never 0: every reinvest buy spends the allocation amount approx
                       const cost = (filledQty > 0 && effectivePrice > 0) ? filledQty * effectivePrice : amountForReinvest;
 
@@ -1069,9 +1242,11 @@ export class TradingEngine {
         }
 
         const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
+        const oracleFloorSell = _oracleSlipFloor(api, sym, 'sell');
+        const oracleFloorBuy  = _oracleSlipFloor(api, sym, 'buy');
         const slipConfig = {
-          sell: kalmanSlipCap(_kalman, sym, _defaultSlip.sell, Math.min(0.08, _defaultSlip.sell * 3)),
-          buy:  kalmanSlipCap(_kalman, sym, _defaultSlip.buy,  Math.min(0.08, _defaultSlip.buy  * 3)),
+          sell: kalmanSlipCap(_kalman, sym, Math.min(oracleFloorSell, _defaultSlip.sell), Math.min(0.08, _defaultSlip.sell * 3)),
+          buy:  kalmanSlipCap(_kalman, sym, Math.min(oracleFloorBuy,  _defaultSlip.buy),  Math.min(0.08, _defaultSlip.buy  * 3)),
         };
         const lastSlippage = (ratSt.lastSlippage !== undefined && ratSt.lastSlippage !== null) ? ratSt.lastSlippage : slipConfig.buy;
         const apiBuySlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].buy : null;
@@ -1130,15 +1305,15 @@ export class TradingEngine {
             if (parseFloat(qty) > 0 && this.cashBalance >= buyUSD) {
               const resp = await this._placeBuy(api, `${sym}-USD`, qty, curP);
               if (resp?.id) {
-                const effectivePrice = getEffectivePriceFromResp(resp, curP) || curP;
+                const effectivePrice = getEffectivePriceFromResp(resp, curP);
 
                 // Measure and update lastSlippage
                 const slippage = (effectivePrice - curP) / curP;
                 if (!this.ratchetState[sym]) {
                   this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                 }
-                this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
+                this.ratchetState[sym].lastSlippage = clampSlippage(slippage);
+                _kalman.observe(sym, clampSlippage(slippage));
                 this._logTrade({ asset: sym, side: 'BUY', quantity: qty, price: effectivePrice.toString(), clientOrderId: resp.client_order_id || resp.id, note: 'Forced Rebalance' });
                 anyTradesThisCycle = true;
                 // Tier 1: Post-Mortem Event (Forced Rebalance is a significant event)
@@ -1239,15 +1414,15 @@ export class TradingEngine {
             if (parseFloat(qty) > 0 && this.cashBalance >= buyUSD) {
               const resp = await this._placeBuy(api, `${sym}-USD`, qty, curP);
               if (resp?.id) {
-                const effectivePrice = getEffectivePriceFromResp(resp, curP) || curP;
+                const effectivePrice = getEffectivePriceFromResp(resp, curP);
 
                 // Measure and update lastSlippage
                 const slippage = (effectivePrice - curP) / curP;
                 if (!this.ratchetState[sym]) {
                   this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
                 }
-                this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
+                this.ratchetState[sym].lastSlippage = clampSlippage(slippage);
+                _kalman.observe(sym, clampSlippage(slippage));
                 this._logTrade({ asset: sym, side: 'BUY', quantity: qty, price: effectivePrice.toString(), clientOrderId: resp.client_order_id || resp.id, note: 'Rebalance Buy' });
                 anyTradesThisCycle = true;
                 // Tier 1: Post-Mortem Event
@@ -1348,92 +1523,122 @@ export class TradingEngine {
         !HARVEST_EXCLUDE.includes(r.Symbol) && (activeHoldings[r.Symbol]?.rawQuantity || 0) > 0
       ).length;
 
+      // Refresh alpha source from the API. Run at most once per cycle to keep
+      // the engine compute-free. The result is a ranked list of symbols the
+      // market is shaping right now (5-min WS tape; falls back to 24h gainers).
+      const alphaRanked = await this._refreshAlphaCandidates(api);
+      const _candidateFilter = (sym) =>
+        !HARVEST_EXCLUDE.includes(sym) &&
+        (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
+        (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0) &&
+        // Skip symbols with recent price-fetch failures (5-minute cooldown)
+        (!this._priceFetchFailures.get(sym) || (now - this._priceFetchFailures.get(sym)) > 5 * 60 * 1000);
+
+      // Spawn queue is the union of ranked alpha + the static fallback map,
+      // with alpha FIRST in iteration order. This way real movers get traded
+      // BEFORE the static fallback map picks dumb-shit crypto. The static
+      // map remains the safety net when the alpha source is cold.
+      const spawnQueue = [
+        ...(alphaRanked || []).map(e => e.symbol),
+        ...Object.keys(MIN_ORDER_QTY_MAP),
+      ];
+
+      const candidateUniverse = currentHoldingCount < MAX_HOLDINGS
+        ? [...new Set(spawnQueue.filter(_candidateFilter))]
+        : [];
+      let spawnPriceMap = priceMap || {};
+
+      // Warm the public WS price spine in bulk before choosing a spawn target.
+      // Do not discover prices by hammering getQuotes([sym]) one candidate at a time.
+      // ticker_batch is the market-data transport; if no tick arrives, skip.
+      if (candidateUniverse.length > 0 && typeof api?.waitForWsPriceMap === 'function') {
+        const warmLimit = SNOWBALL_CONFIG.SPAWN_PRICE_WARMUP_LIMIT ?? 120;
+        const warmSymbols = candidateUniverse.slice(0, warmLimit);
+        const warmed = await api.waitForWsPriceMap(warmSymbols, 6_000, 1).catch(() => ({}));
+        if (warmed && Object.keys(warmed).length > 0) {
+          spawnPriceMap = { ...spawnPriceMap, ...warmed };
+        }
+      }
+
       const nextSym = currentHoldingCount < MAX_HOLDINGS
-        ? Object.keys(MIN_ORDER_QTY_MAP).find(sym =>
-            !HARVEST_EXCLUDE.includes(sym) &&
-            (!tokenBaselines[sym] || tokenBaselines[sym] <= 0) &&
-            (!activeHoldings[sym] || (activeHoldings[sym].rawQuantity || 0) <= 0)
-          )
+        ? (candidateUniverse.find(sym => spawnPriceMap?.[sym] > 0) || candidateUniverse[0] || null)
         : null;
 
       if (nextSym) {
         if (this.cashBalance >= crashFundUSD + spawnCost) {
-          if (this.mode === 'LIVE') {
-            console.log(`🐛 [MITOSIS SPAWNER] Cash balance $${this.cashBalance.toFixed(2)} is >= Crash Fund ($${crashFundUSD.toFixed(2)}) + Spawn Cost ($${spawnCost.toFixed(2)}).`);
-            console.log(`   → Spawning new asset grid: ${nextSym}. Mitosis starting...`);
-            try {
-              // A. Initialize baseline & timestamp
-              tokenBaselines[nextSym] = spawnCost;
-              lastActionTimestamps[nextSym] = now;
-              stateChanged = true;
+          // Uniform spawn path — single code path regardless of executor. The router
+          // is `_executeFill`, which selects sim vs live fill source internally but
+          // is otherwise the same record-and-mutate spine for both modes. The audit
+          // ringbuffer records every fill so calibration/state are identical.
+          const hydrationCost = spawnCost;
+          // Price source priority: explicit priceMap (test param) > WS-warmed price map > portfolioSummary > WS getQuotes wait.
+          // getQuotes is WS-only; it must not fall back to per-symbol REST.
+          const buyP = (priceMap && priceMap[nextSym] && priceMap[nextSym] > 0)
+            ? priceMap[nextSym]
+            : (spawnPriceMap && spawnPriceMap[nextSym] && spawnPriceMap[nextSym] > 0)
+              ? spawnPriceMap[nextSym]
+              : (portfolioSummary.find(r => r.Symbol === nextSym)?.Price)
+                || ((await api?.getQuotes?.([nextSym]))?.[nextSym]);
 
-              // B. Execute 100% Spawn Buy (market buy 100% of spawnCost)
-              const hydrationCost = spawnCost;
-              const buyP = portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym];
+          if (!buyP || buyP <= 0) {
+            // Record failure for cooldown — avoid spamming the same symbol every cycle
+            this._priceFetchFailures.set(nextSym, now);
+            console.warn(`⚠️ [MITOSIS] Could not fetch price for ${nextSym}, skipping spawn (5min cooldown)`);
+          } else {
+            const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
+            if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
+              try {
+                const confirmedBuy = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
+                if (confirmedBuy?.id) {
+                  // The fill shape is identical regardless of executor (sim or live)
+                  const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
+                  const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
+                  const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP);
 
-              if (!buyP || buyP <= 0) {
-                console.warn(`⚠️ [MITOSIS] Could not fetch price for ${nextSym}, skipping spawn`);
-              } else {
-                const buyQtyStr = roundQty(nextSym, hydrationCost / buyP);
+                  // baseline initialized to spawnCost regardless of mode
+                  tokenBaselines[nextSym] = spawnCost;
+                  lastActionTimestamps[nextSym] = now;
+                  stateChanged = true;
 
-                if (parseFloat(buyQtyStr) > 0 && checkMinQuantity(nextSym, buyQtyStr)) {
-                  console.log(`   → Placing 100% spawn buy for ${buyQtyStr} ${nextSym}...`);
-                  const buyResp = await this._placeBuy(api, `${nextSym}-USD`, buyQtyStr, buyP);
-                  if (buyResp?.id) {
-                    const confirmedBuy = buyResp;
-                    if (confirmedBuy) {
-                      const rawQty = parseFloat(confirmedBuy.filled_asset_quantity);
-                      const filledQty = (rawQty > 0) ? rawQty : parseFloat(buyQtyStr);
-                      const effectivePrice = getEffectivePriceFromResp(confirmedBuy, buyP) || buyP;
+                  // Reflect the new fill into internal holdings so subsequent cycles
+                  // see the asset as held. In LIVE this matches Coinbase; in SIM this
+                  // is the source of truth (no exchange to ask).
+                  if (!this.holdings[nextSym]) this.holdings[nextSym] = { rawQuantity: 0 };
+                  this.holdings[nextSym].rawQuantity = (parseFloat(this.holdings[nextSym].rawQuantity) || 0) + filledQty;
 
-                      // slippage
-                      const slippage = (effectivePrice - buyP) / buyP;
-                      const sym = nextSym;
-                      if (!this.ratchetState[sym]) {
-                        this.ratchetState[sym] = { harvestModifier: 0.0, rebalanceModifier: 0.0, lastTradeSide: null, localCostBasis: 0.0, localQty: 0.0 };
-                      }
-                      this.ratchetState[sym].lastSlippage = Math.min(0.04, Math.max(0, slippage));
-                      _kalman.observe(sym, Math.min(0.04, Math.max(0, slippage)));
-                      const actualCost = filledQty * effectivePrice;
+                  // slippage → ratchet → kalman observation (uniform)
+                  const slippage = (effectivePrice - buyP) / buyP;
+                  const sym = nextSym;
+                  const clamped = clampSlippage(slippage);
+                  this.ratchetState[sym] = {
+                    harvestModifier: 0.0,
+                    rebalanceModifier: 0.0,
+                    lastSlippage: clamped,
+                    lastTradeSide: 'BUY',
+                    localCostBasis: effectivePrice,
+                    localQty: filledQty,
+                  };
+                  _kalman.observe(sym, clamped);
 
-                      this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
+                  // Cost basis init recorded above (ratchetState[sym] carries the cost basis).
+                  const actualCost = filledQty * effectivePrice;
+                  this._logTrade({ asset: nextSym, side: 'BUY', quantity: filledQty.toString(), price: effectivePrice.toString(), clientOrderId: confirmedBuy.client_order_id || confirmedBuy.id, note: 'Mitosis 100% Spawn Buy' });
 
-                      // Initialize Cost Basis for Newly Spawned Asset
-                      this.ratchetState[nextSym] = {
-                        harvestModifier: 0.0,
-                        rebalanceModifier: 0.0,
-                        lastTradeSide: 'BUY',
-                        localCostBasis: effectivePrice,
-                        localQty: filledQty
-                      };
-                      console.log(`📈 [COST BASIS] ${nextSym} Spawn Hydrated! Qty: ${filledQty.toFixed(4)} @ $${effectivePrice.toFixed(8)}. Initialized Cost Basis: $${effectivePrice.toFixed(8)}`);
-
-                      anyTradesThisCycle = true;
-
-                      this.cashBalance -= actualCost;
-                      if (this.cashBalance < 0) this.cashBalance = 0;
-                      if (this.mode === 'LIVE') saveState();
-                      console.log(`   ✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
-                    }
+                  anyTradesThisCycle = true;
+                  this.cashBalance -= actualCost;
+                  if (this.cashBalance < 0) this.cashBalance = 0;
+                  if (this.mode === 'LIVE' && typeof globalThis.saveState === 'function') globalThis.saveState();
+                  if (this.executor === 'live') {
+                    console.log(`✅ [MITOSIS COMPLETE] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
+                  } else {
+                    // Same log line, different gate — engine actions identical.
+                    console.log(`📄 [MITOSIS SIM] Spawned ${nextSym} with baseline $${spawnCost.toFixed(2)}. Hydrated 100%: $${actualCost.toFixed(2)}.`);
                   }
                 }
+              } catch (err) {
+                console.error("❌ [MITOSIS] Failed to execute spawn:", err.message);
               }
-            } catch (err) {
-              console.error("❌ [MITOSIS] Failed to execute spawn:", err.message);
             }
-          } else if (this.mode === 'SHADOW') {
-            // Shadow Spawner Simulation (Instant)
-            tokenBaselines[nextSym] = spawnCost;
-            lastActionTimestamps[nextSym] = now;
-            anyTradesThisCycle = true;
-
-            const hydrationCost = spawnCost;
-            const buyP = (priceMap && priceMap[nextSym]) || portfolioSummary.find(r => r.Symbol === nextSym)?.Price || (await api?.getQuotes([nextSym]))?.[nextSym] || 1.00;
-            const buyQty = hydrationCost / buyP;
-
-            if (!this.holdings[nextSym]) this.holdings[nextSym] = { rawQuantity: 0 };
-            this.holdings[nextSym].rawQuantity += buyQty;
-            this.cashBalance -= (spawnCost * 1.01); // 1% buy fee in shadow
           }
         }
       }

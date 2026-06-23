@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { createClient } from '../../coinbase-advanced.js';
 import {
   metricSlippageFromBook,
+  metricSlippage,
   metricSlippageFromHistory,
   metricSlippageCap,
   metricRecordSlippage,
@@ -21,10 +22,10 @@ let ethBook;
 
 before(async () => {
   client = createClient();
-  // Fetch real order books for the primary assets
+  // Fetch real order books for the primary assets. Product metadata is not a book.
   const [btcResp, ethResp] = await Promise.all([
-    client.getProduct('BTC-USD'),
-    client.getProduct('ETH-USD'),
+    client.getProductBook('BTC-USD', 50),
+    client.getProductBook('ETH-USD', 50),
   ]);
   btcBook = btcResp;
   ethBook = ethResp;
@@ -133,7 +134,7 @@ describe('QUANT SLIPPAGE: history fallback when book unavailable', () => {
 
   test('metricSlippage returns null when both book and history missing', () => {
     const slip = metricSlippage({ book: null, fillHistory: [], side: 'sell', orderSizeUsd: 100 });
-    assert.equal(slip, null, null, null, 'Must return null, never a scalar guess');
+    assert.equal(slip, null, 'Must return null, never a scalar guess');
     // The caller must handle null (skip trade, widen threshold, etc.)
   });
 });

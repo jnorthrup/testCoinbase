@@ -4,7 +4,9 @@
 import { parseOptionalNumber } from './helpers.mjs';
 
 export function getEffectivePriceFromResp(resp, fallbackPrice) {
-  const priceStr = resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price || fallbackPrice?.toString();
+  // Prefer verified fill price from REST — do NOT silently fall back to expected price.
+  // Caller must decide what to do when fill price is absent (log warning, skip Kalman obs, etc.)
+  const priceStr = resp?.average_filled_price || resp?.average_price || resp?.executions?.[0]?.effective_price || resp?.price;
   if (priceStr === undefined || priceStr === null) return null;
   const priceNum = parseFloat(priceStr);
   return !isNaN(priceNum) && priceNum > 0 ? priceNum : null;

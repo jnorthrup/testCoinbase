@@ -8,7 +8,18 @@ const path = require('path');
 const { sign } = require('jsonwebtoken');
 
 const API_HOST = process.env.COINBASE_API_HOST || 'api.coinbase.com';
+const PUBLIC_API_HOST = 'api.exchange.coinbase.com';  // public, no auth needed
 const DEFAULT_CREDENTIAL_FILE = process.env.COINBASE_API_KEY_FILE || path.join(process.env.HOME, '.cdp', 'cdp_api_key.json');
+
+// Public endpoints that don't require authentication
+const PUBLIC_ENDPOINTS = new Set([
+  'products',
+  'products/',
+]);
+
+function isPublicEndpoint(path) {
+  return PUBLIC_ENDPOINTS.has(path) || path.startsWith('products/');
+}
 
 class CoinbaseApiError extends Error {
   constructor(statusCode, bodyText, requestPath) {
@@ -63,6 +74,8 @@ function loadCredentials() {
 function toBrokeragePath(requestPath) {
   const clean = String(requestPath || '').trim();
   if (!clean) throw new Error('Missing Coinbase request path');
+  // Public endpoints don't need brokerage prefix
+  if (isPublicEndpoint(clean)) return `/${clean.replace(/^\/+/, '')}`;
   if (clean.startsWith('/api/v3/brokerage/')) return clean;
   if (clean.startsWith('api/v3/brokerage/')) return `/${clean}`;
   return `/api/v3/brokerage/${clean.replace(/^\/+/, '')}`;
@@ -128,18 +141,25 @@ function request({ method = 'GET', requestPath, query, body, credentials = loadC
 
   function attempt(attemptNum) {
     return new Promise((resolve, reject) => {
+      // Use public host for public endpoints (no auth needed)
+      const host = isPublicEndpoint(requestPath) ? PUBLIC_API_HOST : API_HOST;
+      const isPublic = isPublicEndpoint(requestPath);
       const headers = {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
         'Content-Type': 'application/json',
       };
+      // Public endpoints require User-Agent
+      if (isPublic) {
+        headers['User-Agent'] = 'CoinbaseBot/1.0';
+      }
       if (payload !== undefined) {
         headers['Content-Length'] = Buffer.byteLength(payload);
       }
 
       const req = https.request(
         {
-          hostname: API_HOST,
+          hostname: host,
           path: pathWithQuery,
           method: method.toUpperCase(),
           headers,
@@ -175,15 +195,36 @@ function request({ method = 'GET', requestPath, query, body, credentials = loadC
 }
 
 function createClient(credentials = loadCredentials()) {
+  const normalizeProductBook = (body) => {
+    const pricebook = body && (body.pricebook || body);
+    const normalizeLevel = (level) => Array.isArray(level)
+      ? [String(level[0]), String(level[1])]
+      : [String(level?.price), String(level?.size)];
+    return {
+      product_id: pricebook?.product_id,
+      bids: (pricebook?.bids || []).map(normalizeLevel).filter(([price, size]) => price !== 'undefined' && size !== 'undefined'),
+      asks: (pricebook?.asks || []).map(normalizeLevel).filter(([price, size]) => price !== 'undefined' && size !== 'undefined'),
+      time: pricebook?.time,
+      raw: body,
+    };
+  };
+
   return {
     credentialsSource: credentials.source,
     request: (args) => request({ ...args, credentials }),
     listAccounts: () => request({ method: 'GET', requestPath: 'accounts', credentials }).then((r) => r.body),
     getProduct: (productId) => request({ method: 'GET', requestPath: `products/${productId}`, credentials }).then((r) => r.body),
+    getProductBook: (productId, limit = 50) => request({
+      method: 'GET',
+      requestPath: 'market/product_book',
+      query: { product_id: productId, limit },
+      credentials,
+    }).then((r) => normalizeProductBook(r.body)),
     previewOrder: (body) => request({ method: 'POST', requestPath: 'orders/preview', body, credentials }).then((r) => r.body),
     createOrder: (body) => request({ method: 'POST', requestPath: 'orders', body, credentials }).then((r) => r.body),
     getOrder: (orderId) => request({ method: 'GET', requestPath: `orders/historical/${orderId}`, credentials }).then((r) => r.body),
-    getProducts: () => request({ method: 'GET', requestPath: 'products', credentials }).then((r) => r.body),
+    getProducts: () => request({ method: 'GET', requestPath: 'products', credentials })
+      .then((r) => Array.isArray(r.body) ? { products: r.body } : r.body),
     getCandles: (productId, granularity, start, end) => {
       const params = new URLSearchParams({ granularity: String(granularity) });
       if (start) params.set('start', String(start));
@@ -219,10 +260,10 @@ async function buildMinOrderQtyMap(client = null) {
   const map = {};
   for (const p of products) {
     // Only online USD pairs
-    if (p.status !== 'online' || !p.product_id?.endsWith('-USD')) continue;
+    if (p.status !== 'online' || !p.id?.endsWith('-USD')) continue;
     
     // Extract base currency from product_id (e.g., "BTC-USD" -> "BTC")
-    const base = p.product_id.split('-')[0];
+    const base = p.id.split('-')[0];
     const inc = p.base_increment;
     
     if (!base || !inc) continue;
