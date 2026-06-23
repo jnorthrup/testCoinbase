@@ -2,6 +2,11 @@
 // Now incorporates RSI, Bollinger, and composite alpha conviction for more nuanced
 // regime detection. This enables the trading system to generate additional alpha
 // by adapting harvest/rebalance/spawn logic based on momentum + mean-reversion signals.
+//
+// Performance & Idempotency: Heavy indicator calculations (RSI, BB, ROC, AlphaConviction)
+// are memoized using the shared idempotent-cache utility. Repeated analyses on the same
+// or highly similar price histories (common in optimizer sweeps and backtests) are fast
+// and perfectly deterministic.
 
 import {
   calculateRSI,
@@ -9,6 +14,15 @@ import {
   calculateROC,
   calculateAlphaConviction
 } from '../estimation/technical-indicators.mjs';
+
+import { memoize } from '../utils/idempotent-cache.mjs';
+
+// Memoized indicator functions for performance in repeated regime analysis
+// (keyed intelligently on array length + tail hash for large price histories)
+const memoizedCalculateRSI = memoize(calculateRSI, { maxSize: 64 });
+const memoizedCalculateBollingerBands = memoize(calculateBollingerBands, { maxSize: 64 });
+const memoizedCalculateROC = memoize(calculateROC, { maxSize: 64 });
+const memoizedCalculateAlphaConviction = memoize(calculateAlphaConviction, { maxSize: 32 });
 
 export class RegimeDetector {
   constructor() {
@@ -31,11 +45,11 @@ export class RegimeDetector {
     const variance = history.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / history.length;
     const volatility = Math.sqrt(variance) / mean;
 
-    // --- NEW: Alpha factors from technical indicators ---
-    const rsi = calculateRSI(history, 14);
-    const bb = calculateBollingerBands(history, 20);
-    const roc = calculateROC(history, 10);
-    const alphaConv = calculateAlphaConviction(history, { rsiPeriod: 14, bbPeriod: 20, rocPeriod: 10 });
+    // --- NEW: Alpha factors from technical indicators (memoized for speed & idempotency) ---
+    const rsi = memoizedCalculateRSI(history, 14);
+    const bb = memoizedCalculateBollingerBands(history, 20);
+    const roc = memoizedCalculateROC(history, 10);
+    const alphaConv = memoizedCalculateAlphaConviction(history, { rsiPeriod: 14, bbPeriod: 20, rocPeriod: 10 });
 
     let regime = 'CRAB_CHOP';
     let regimeReason = 'base_vol_roi';
