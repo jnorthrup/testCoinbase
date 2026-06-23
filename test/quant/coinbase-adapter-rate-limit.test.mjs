@@ -54,12 +54,18 @@ describe('CoinbaseWormAPI rate-limit guardrails', () => {
   test('products and accounts snapshots coalesce concurrent callers', async () => {
     const api = new CoinbaseWormAPI({ readOnly: true });
 
+    // BatchingAPI sits below named methods — it calls client.request() directly.
+    // Mock the request backbone, not the named methods.
     let productCalls = 0;
-    api.client.getProducts = async () => {
-      productCalls++;
-      await new Promise(resolve => setTimeout(resolve, 20));
-      return { products: [{ id: 'BTC-USD', status: 'online', price: '64000', price_percentage_change_24h: '1', volume_24h: '100' }] };
+    api.client.request = async ({ requestPath }) => {
+      if (requestPath === 'products') {
+        productCalls++;
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return { body: { products: [{ id: 'BTC-USD', status: 'online', price: '64000', price_percentage_change_24h: '1', volume_24h: '100' }] } };
+      }
+      throw new Error(`Unexpected request: ${requestPath}`);
     };
+
     await Promise.all([
       api._getProductsCached(),
       api.getGainersLosers(1),
@@ -68,11 +74,15 @@ describe('CoinbaseWormAPI rate-limit guardrails', () => {
     assert.equal(productCalls, 1);
 
     let accountCalls = 0;
-    api.client.listAccounts = async () => {
-      accountCalls++;
-      await new Promise(resolve => setTimeout(resolve, 20));
-      return { accounts: [{ currency: 'USD', available_balance: { value: '100' }, hold: { value: '0' } }] };
+    api.client.request = async ({ requestPath }) => {
+      if (requestPath === 'accounts') {
+        accountCalls++;
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return { body: { accounts: [{ currency: 'USD', available_balance: { value: '100' }, hold: { value: '0' } }] } };
+      }
+      throw new Error(`Unexpected request: ${requestPath}`);
     };
+
     await Promise.all([api.getBalance(), api.getHoldings()]);
     assert.equal(accountCalls, 1);
   });
