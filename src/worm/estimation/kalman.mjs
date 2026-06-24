@@ -146,6 +146,75 @@ class MultiAssetKalman {
       reason: healthy ? 'innovations_zero_mean' : 'innovations_biased',
     };
   }
+
+  /**
+   * Classify the symbol's recent volatility regime by comparing the latest
+   * innovations-variance to the historical innovations-variance. Returns one of:
+   *   'STABLE'      — variance in line with historical mean (within band)
+   *   'COMPRESSING' — variance contracting (current < historical - band)
+   *   'EXPANDING'   — variance expanding (current > historical + band)
+   * If fewer than `minPoints` innovations are available, returns the prior
+   * classification (or 'STABLE' on first call).
+   */
+  classifyRegime(symbol, halfWindow = 10, transitionBand = 1.5, minPoints = 20) {
+    const filter = this.filters.get(symbol);
+    if (!filter || !filter.innovations || filter.innovations.length < minPoints) {
+      return filter && filter._lastRegime ? filter._lastRegime : 'STABLE';
+    }
+    const all = filter.innovations;
+    const recent = all.slice(-halfWindow);
+    const historic = all.slice(-halfWindow * 2, -halfWindow);
+    if (historic.length < 2) {
+      return filter._lastRegime || 'STABLE';
+    }
+    const varianceOf = (xs) => {
+      const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+      return xs.reduce((s, x) => s + (x - m) ** 2, 0) / xs.length;
+    };
+    const recentVar = varianceOf(recent);
+    const historicVar = varianceOf(historic);
+    let regime;
+    if (recentVar < historicVar / transitionBand) regime = 'COMPRESSING';
+    else if (recentVar > historicVar * transitionBand) regime = 'EXPANDING';
+    else regime = 'STABLE';
+    filter._lastRegime = regime;
+    return regime;
+  }
+
+  /**
+   * Serialize the per-symbol filter state so volatility survives across engine reconstruction.
+   * Returns a plain object suitable for JSON.stringify.
+   */
+  serialize() {
+    const out = {};
+    for (const [symbol, filter] of this.filters) {
+      out[symbol] = {
+        x: filter.x,
+        P: filter.P,
+        initialized: filter.initialized,
+        n: filter.n,
+        lastRegime: filter._lastRegime || 'STABLE',
+      };
+    }
+    return out;
+  }
+
+  /**
+   * Restore serialized filter state from a prior `serialize()` round-trip.
+   * Filters whose symbol is not present in `state` get a fresh initialization
+   * on first use; filters present get their x / P / n / regime advanced.
+   */
+  restore(state) {
+    if (!state || typeof state !== 'object') return;
+    for (const [symbol, f] of Object.entries(state)) {
+      const filter = this.getFilter(symbol);
+      filter.x = Number.isFinite(f.x) ? f.x : this.defaults.x0;
+      filter.P = Number.isFinite(f.P) && f.P > 0 ? f.P : this.defaults.p0;
+      filter.initialized = Boolean(f.initialized);
+      filter.n = Number.isFinite(f.n) && f.n > 0 ? f.n : 0;
+      filter._lastRegime = typeof f.lastRegime === 'string' ? f.lastRegime : 'STABLE';
+    }
+  }
 }
 
 function kalmanSlipCap(filter, symbol, floor = 0.01, ceiling = 0.10) {

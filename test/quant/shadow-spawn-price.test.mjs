@@ -34,8 +34,16 @@ describe('TradingEngine shadow mitosis price sourcing', () => {
   test('priceMap price sizes shadow spawn by actual asset price, not $1', async () => {
     setMinOrderQtyMap({ ZEC: 0.00001 });
     const engine = makeShadowEngine();
+    // Provide an existing portfolio with a high-value position so the spawn
+    // (baselines.ZEC = $30) fits within RiskPolicy's CASH_FLOOR + asset-pct caps.
+    // cashFloor = 10% * (BTC_value + cash) = 0.10 * 1100 = $110. After trade cash
+    // goes from $200 -> $170 (still above $110). Trade notional $30 ≈ 2.7%
+    // of $1100 < 20% MAX_ASSET_PCT cap.
+    const portfolioSummary = [
+      { Symbol: 'BTC', Quantity: 0.02, Price: 50_000, Value: 1_000, Baseline: 1_000 },
+    ];
 
-    const result = await engine.update([], null, 100, {}, Date.now(), { ZEC: 465 });
+    const result = await engine.update(portfolioSummary, null, 200, {}, Date.now(), { ZEC: 465 });
 
     assert.equal(result.anyTradesThisCycle, true);
     assert.equal(engine.baselines.ZEC, 30);
@@ -44,6 +52,6 @@ describe('TradingEngine shadow mitosis price sourcing', () => {
     assert.ok(Math.abs(engine.holdings.ZEC.rawQuantity - expectedQty) < 1e-12);
     // Cash reduced by actualCost = filledQty * effectivePrice (includes slippage ~0.5-1%)
     // Just verify cash decreased by approximately spawnCost
-    assert.ok(engine.cashBalance < 100 && engine.cashBalance > 60);
+    assert.ok(engine.cashBalance < 200 && engine.cashBalance > 150);
   });
 });

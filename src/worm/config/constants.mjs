@@ -121,6 +121,21 @@ export const defaultGenome = {
   ADAPTIVE_SKIP_BASELINE_ADJUST: true,
   FLASH_THRESHOLD: 0.05,
   FLASH_COOLDOWN: 15 * 60 * 1000,
+
+  // Trigger-side: volatility scaling on harvest/rebalance triggers.
+  // Single number: how aggressively filtered vol shrinks the trigger.
+  // Math: modulatedTrigger = baseTrigger * (1 + filteredVol * TRIGGER_VOL_SENSITIVITY).
+  TRIGGER_VOL_SENSITIVITY: 2.8,
+
+  // Risk-side: named caps per invariant. Replace the legacy regimeCurry multiplier
+  // stack with three explicit caps keyed by regime. The RiskPolicy reads these
+  // directly off the genome via constantsFor(regime).
+  RISK_MAX_SPAWN_PCT_OF_PORTFOLIO: 0.02,
+  RISK_MAX_SINGLE_ASSET_PCT_OF_PORTFOLIO: 0.20,
+  RISK_MAX_VOL_PCT_TRADEABLE_STABLE: 0.06,
+  RISK_MAX_VOL_PCT_TRADEABLE_EXPANDING: 0.036,
+  RISK_MAX_VOL_PCT_TRADEABLE_COMPRESSING: 0.048,
+  RISK_CRASH_FUND_PCT_FLOOR: 0.10,
 };
 export const LEGION_CONFIG = {
   DREAMER_WORKER_COUNT: 1,
