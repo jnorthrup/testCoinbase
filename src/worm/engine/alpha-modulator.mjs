@@ -1,5 +1,4 @@
 // src/worm/engine/alpha-modulator.mjs
-// Highest-leverage integration layer between technical alpha signals and the TradingEngine.
 
 import { memoize } from '../utils/idempotent-cache.mjs';
 import { calculateAlphaConviction } from '../estimation/technical-indicators.mjs';
@@ -36,14 +35,20 @@ export function getAlphaModulatedTriggers({
   recentPrices = null,
   convictionOptions = {}
 }) {
-  const conviction = getAlphaConviction(recentPrices, convictionOptions);
+  const convictionResult = calculateAlphaConviction(recentPrices, convictionOptions);
+  const conviction = convictionResult?.conviction ?? 0;
+
   const harvest = modulateHarvestTrigger(flatHarvestTrigger + harvestModifier, conviction);
   const rebalance = modulateRebalanceTrigger(flatRebalanceTrigger + rebalanceModifier, conviction);
+
   return {
     conviction,
     modulatedHarvestTrigger: harvest,
     modulatedRebalanceTrigger: rebalance,
-    alphaInterpretation: conviction > 0.25 ? 'BULLISH' : conviction < -0.25 ? 'BEARISH' : 'NEUTRAL'
+    alphaInterpretation: conviction > 0.25 ? 'BULLISH' : conviction < -0.25 ? 'BEARISH' : 'NEUTRAL',
+    filteredVolatility: convictionResult?.filteredVolatility ?? null,
+    rawVolatility: convictionResult?.rawVolatility ?? null,
+    volAdjustment: convictionResult?.volAdjustment ?? 1.0
   };
 }
 
