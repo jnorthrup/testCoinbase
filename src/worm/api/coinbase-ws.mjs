@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const WebSocket = require('ws');
 const { sign } = require('jsonwebtoken');
 const { createClient } = require('../../../coinbase-advanced.js');
+import { candleDb } from '../data/candle-db.mjs';
 
 const WS_URL = 'wss://advanced-trade-ws.coinbase.com';
 const CANDLE_SEED_GRANULARITY = 300; // 5-minute candles; 300 candles = 25h of history
@@ -260,6 +261,11 @@ class CoinbaseWS {
           else arr.push(candle);
           // Keep sorted, cap at 1000
           if (arr.length > 1000) arr.shift();
+
+          // Persist WS update to DuckDB
+          candleDb.saveCandles(productId, gran, [candle]).catch(err => {
+            console.warn(`[WS] Failed to save WS candle to DuckDB for ${productId}:`, err.message);
+          });
         }
       }
     }
@@ -269,35 +275,75 @@ class CoinbaseWS {
 
   async _seedCandles(productIds) {
     const now   = Math.floor(Date.now() / 1000);
-    const start = now - CANDLE_SEED_GRANULARITY * CANDLE_SEED_COUNT;
     const gran  = CANDLE_SEED_GRANULARITY;
 
     await Promise.allSettled(productIds.map(async (productId) => {
       const key = `${productId}:${gran}`;
       if (this.candleCache.has(key)) return; // already seeded or previously attempted
 
-      // Mark attempted BEFORE the request — prevents retry storm on Unauthorized
+      // Mark attempted BEFORE any async operations to prevent concurrent attempts
       this.candleCache.set(key, []);
 
+      // Try reading from DuckDB first (draw-through cache)
+      let dbCandles = [];
       try {
-        const body = await this.restClient.getCandles(productId, gran, start, now);
-        const raw  = body?.candles || [];
-        if (raw.length === 0) return;
+        dbCandles = await candleDb.getCandles(productId, gran);
+      } catch (err) {
+        console.warn(`[WS] Failed to read from DuckDB for ${productId}:`, err.message);
+      }
 
-        const candles = raw.map(c => ({
+      const hasDbCandles = dbCandles.length > 0;
+      const latestDbTimestamp = hasDbCandles ? dbCandles[dbCandles.length - 1].start : 0;
+      const ageSeconds = now - latestDbTimestamp;
+
+      // Freshness: if database has candles and the last one is younger than 10 mins (600s),
+      // we consider it a complete cache hit and skip the REST API request.
+      if (hasDbCandles && ageSeconds < 600) {
+        this.candleCache.set(key, dbCandles);
+        console.log(`[WS] Cache HIT (DuckDB): Loaded ${dbCandles.length} candles for ${productId} (${gran}s)`);
+        return;
+      }
+
+      try {
+        const fetchStart = hasDbCandles ? latestDbTimestamp : (now - gran * CANDLE_SEED_COUNT);
+        const body = await this.restClient.getCandles(productId, gran, fetchStart, now);
+        const raw  = body?.candles || [];
+        
+        const apiCandles = raw.map(c => ({
           start:  Number(c.start),
           open:   parseFloat(c.open),
           high:   parseFloat(c.high),
           low:    parseFloat(c.low),
           close:  parseFloat(c.close),
           volume: parseFloat(c.volume),
-        })).sort((a, b) => a.start - b.start);
+        }));
 
-        this.candleCache.set(key, candles);
-        console.log(`[WS] Seeded ${candles.length} candles for ${productId} (${gran}s)`);
+        // Merge DB candles with new API candles, deduping by start timestamp
+        const mergedMap = new Map();
+        dbCandles.forEach(c => mergedMap.set(c.start, c));
+        apiCandles.forEach(c => mergedMap.set(c.start, c));
+
+        const mergedCandles = [...mergedMap.values()]
+          .sort((a, b) => a.start - b.start)
+          .slice(-CANDLE_SEED_COUNT);
+
+        this.candleCache.set(key, mergedCandles);
+
+        if (mergedCandles.length > 0) {
+          candleDb.saveCandles(productId, gran, mergedCandles).catch(err => {
+            console.warn(`[WS] Failed to save to DuckDB for ${productId}:`, err.message);
+          });
+        }
+
+        console.log(`[WS] Cache DRAW-THROUGH: Loaded ${mergedCandles.length} candles for ${productId} (API returned ${raw.length} new)`);
       } catch (err) {
-        // Non-fatal — sentinel [] already set above, won't retry
-        console.warn(`[WS] Candle seed failed for ${productId}: ${err.message}`);
+        // Fallback to stale DB candles if the API is down / rate-limited
+        if (hasDbCandles) {
+          this.candleCache.set(key, dbCandles);
+          console.warn(`[WS] API fetch failed for ${productId}, falling back to stale DB candles: ${err.message}`);
+        } else {
+          console.warn(`[WS] Candle seed failed for ${productId}: ${err.message}`);
+        }
       }
     }));
   }

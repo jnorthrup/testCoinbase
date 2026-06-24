@@ -7,6 +7,7 @@ import path from "path";
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
+import { createWalletFacade } from './src/worm/api/wallet-facade.mjs';
 import { createClient, buildMinOrderQtyMap } from './coinbase-advanced.js';
 import {
   minIncrementMap,
@@ -185,6 +186,7 @@ async function mainLoop() {
   await initMinOrderQtyMap();
 
   const dryRunOnce = process.argv.includes('--dry-run-once');
+  const paperMode = process.argv.includes('--paper');
   const previewOrder = parsePreviewOrderArgs(process.argv);
   const strategyPreview = parseStrategyPreviewArgs(process.argv);
   const strategyPlace = parseStrategyPlaceArgs(process.argv);
@@ -201,8 +203,12 @@ async function mainLoop() {
   let rh;
   try {
     const baseCoinbaseApi = new CoinbaseWormAPI({ readOnly, previewOnly: previewMode });
-    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : readOnly ? ' [READ-ONLY-FACADE]' : '';
-    rh = baseCoinbaseApi;
+    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : paperMode ? ' [PAPER-FACADE]' : readOnly ? ' [READ-ONLY-FACADE]' : '';
+    rh = createWalletFacade(baseCoinbaseApi, {
+      forceSimulated: paperMode,
+      modeLabel: paperMode ? 'paper' : readOnly ? 'read-only' : 'live',
+      startCapital: 10000,
+    });
     console.log(`🔑 Coinbase API Initialized${modeLabel}.`);
   }
   catch (error) { console.error("❌ FATAL: API initialization failed:", error.message); rl.close(); return; }
@@ -219,6 +225,24 @@ async function mainLoop() {
     if (loadedData.overflowTarget) {
       SNOWBALL_CONFIG.OVERFLOW_TARGET = loadedData.overflowTarget;
       console.log(`🎯 [Worm Config] Restored dynamic overflow target: ${SNOWBALL_CONFIG.OVERFLOW_TARGET}`);
+    }
+  }
+
+  if (paperMode && typeof rh.seedSimulationFromState === 'function') {
+    const loadedCash = loadedData?.cashBalance;
+    const hasValidCash = Number.isFinite(loadedCash) && loadedCash > 0;
+    rh.seedSimulationFromState({
+      cashBalance: hasValidCash ? loadedCash : undefined,
+      holdings: hasValidCash ? loadedData?.holdings : undefined,
+      fallbackCash: 10000,
+    });
+    const simSnapshot = rh.snapshot?.();
+    if (simSnapshot) {
+      liveEngine.cashBalance = simSnapshot.cashBalance;
+      liveEngine.holdings = simSnapshot.holdings;
+      if (liveEngine.initialCapital <= 0 && simSnapshot.cashBalance > 0) liveEngine.initialCapital = simSnapshot.cashBalance;
+      if (liveEngine.peakTotalValue <= 0 && simSnapshot.cashBalance > 0) liveEngine.peakTotalValue = simSnapshot.cashBalance;
+      console.log(`📄 Wallet facade active: simulated orders/portfolio, live Coinbase market data. Cash $${simSnapshot.cashBalance.toFixed(2)}.`);
     }
   }
   if (loadedGenome) {

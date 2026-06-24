@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && npm run worm:check && node portfolio.js --help >/dev/null && node agent-trader.js --help >/dev/null",
-    "test:safety": "node --test test/safety/risk-grounding.test.mjs",
-    "test:quant": "node --test test/quant/*.test.mjs",
+    "test:safety": "CANDLE_DB_PATH=:memory: node --test test/safety/risk-grounding.test.mjs",
+    "test:quant": "CANDLE_DB_PATH=:memory: node --test test/quant/*.test.mjs",
     "test:all": "node -c coinbase-advanced.js && node -c portfolio.js && node -c agent-trader.js && npm run worm:check && npm run test:safety && npm run test:quant",
     "portfolio": "node portfolio.js",
     "agent:preview-sell-btc": "node agent-trader.js preview-sell BTC 10",
@@ -22,6 +22,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "duckdb": "^1.4.4",
     "jsonwebtoken": "^9.0.3"
   }
 }
