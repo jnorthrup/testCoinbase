@@ -66,13 +66,13 @@ export function calculateAlphaConviction(prices, options = {}) {
 }
 
 export function calculateRSI(prices, period = 14) {
-  // ... existing RSI implementation
+  // existing implementation
 }
 
 export function calculateBollingerBands(prices, period = 20, stdDev = 2) {
-  // ... existing implementation
+  // existing implementation
 }
 
 export function calculateROC(prices, period = 10) {
-  // ... existing implementation
+  // existing implementation
 }
