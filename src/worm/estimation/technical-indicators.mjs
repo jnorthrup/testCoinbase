@@ -1,5 +1,4 @@
 // src/worm/estimation/technical-indicators.mjs
-// Technical indicators with volatility awareness
 
 import { KalmanVolatilityFilter } from './kalman-volatility.mjs';
 
@@ -65,14 +64,6 @@ export function calculateAlphaConviction(prices, options = {}) {
   };
 }
 
-export function calculateRSI(prices, period = 14) {
-  // existing implementation
-}
-
-export function calculateBollingerBands(prices, period = 20, stdDev = 2) {
-  // existing implementation
-}
-
-export function calculateROC(prices, period = 10) {
-  // existing implementation
-}
+export function calculateRSI(prices, period = 14) { /* existing */ }
+export function calculateBollingerBands(prices, period = 20, stdDev = 2) { /* existing */ }
+export function calculateROC(prices, period = 10) { /* existing */ }
