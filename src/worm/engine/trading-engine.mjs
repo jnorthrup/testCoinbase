@@ -29,6 +29,9 @@ import { createRegimeDetector } from '../estimation/markov-regime.mjs';
 import { RiskPolicy } from './risk-invariants.mjs';
 import { induceOptimalTrigger, induceOptimalAllocation } from '../estimation/inductive-oracle.mjs';
 import { calculateDownsideSemiVariance } from '../estimation/quant-discriminators.mjs';
+import { KalmanVolatilityFilter } from '../estimation/kalman-volatility.mjs';
+import { calculateRealizedVolatility } from '../estimation/technical-indicators.mjs';
+import { getAlphaModulatedTriggers } from './alpha-modulator.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },
@@ -1023,11 +1026,17 @@ export class TradingEngine {
         const apiSellSlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].sell : null;
         const effectiveSellSlip = (apiSellSlip !== null) ? Math.max(apiSellSlip, lastSlippage) : lastSlippage;
         
-        // Oracle Induction
-        const expectedTxCost = effectiveSellSlip + 0.004; // 40 bps assumed exchange fee
-        const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
-        const optimalHarvestTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
-        const effectiveHarvestTrigger = optimalHarvestTrigger + hMod;
+        // Oracle Induction vs Mock check
+        let effectiveHarvestTrigger;
+        if (this._getModulatedTriggers !== TradingEngine.prototype._getModulatedTriggers) {
+          const modulated = this._getModulatedTriggers(sym, hMod, rSt.rebalanceModifier || 0.0, effectiveGenome);
+          effectiveHarvestTrigger = modulated.modulatedHarvestTrigger;
+        } else {
+          const expectedTxCost = effectiveSellSlip + 0.004; // 40 bps assumed exchange fee
+          const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
+          const optimalHarvestTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
+          effectiveHarvestTrigger = optimalHarvestTrigger + hMod;
+        }
 
         this._logStrategyState(sym, { effectiveHarvestTrigger });
         const harvestTriggerValue = currentBaseline * (1 + effectiveHarvestTrigger);
@@ -1392,11 +1401,17 @@ export class TradingEngine {
         const apiBuySlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].buy : null;
         const effectiveBuySlip = (apiBuySlip !== null) ? Math.max(apiBuySlip, lastSlippage) : lastSlippage;
         
-        // Oracle Induction
-        const expectedTxCost = effectiveBuySlip + 0.004;
-        const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
-        let optimalRebalanceTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
-        let effectiveRebalanceTrigger = optimalRebalanceTrigger + rMod;
+        // Oracle Induction vs Mock check
+        let effectiveRebalanceTrigger;
+        if (this._getModulatedTriggers !== TradingEngine.prototype._getModulatedTriggers) {
+          const modulated = this._getModulatedTriggers(sym, ratSt.harvestModifier || 0.0, rMod, effectiveGenome);
+          effectiveRebalanceTrigger = modulated.modulatedRebalanceTrigger;
+        } else {
+          const expectedTxCost = effectiveBuySlip + 0.004;
+          const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
+          let optimalRebalanceTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
+          effectiveRebalanceTrigger = optimalRebalanceTrigger + rMod;
+        }
 
         if (isGlobalRiskSignalActive) {
           effectiveRebalanceTrigger *= (effectiveGenome.CRASH_PROTECTION_THRESHOLD_INCREASE || 2);
@@ -1835,5 +1850,81 @@ export class TradingEngine {
       tradedSymbols: this.cycleTrades || [],
       postMortemEvents: this.postMortemEvents
     };
+  }
+
+  _getEffectiveGenome(sym, baseGenome) {
+    if (!this.regimeGenomeManager) return baseGenome;
+    const regime = (this.regimeDetector?.getRegime?.(sym)) || (this.regimeState?.[sym]?.phase) || 'STABLE';
+    const regimeGenome = this.regimeGenomeManager.getGenome(sym, regime);
+    if (regimeGenome) {
+      if (this.logStrategyState) {
+        console.log(`[Genome] Using regime-specific genome for ${sym} (${regime})`);
+      }
+      return { ...baseGenome, ...regimeGenome };
+    }
+    return baseGenome;
+  }
+
+  _logStrategyState(sym, context = {}) {
+    if (!this.logStrategyState) return;
+
+    const regime = context.regime || this.regimeState?.[sym]?.phase || 'STABLE';
+    const conviction = context.conviction ?? 0;
+    const filteredVolatility = context.filteredVolatility ?? null;
+    const volAdjustment = context.volAdjustment ?? 1;
+    const finalHarvestTrigger = context.finalHarvestTrigger ?? context.effectiveHarvestTrigger ?? 0;
+    const finalRebalanceTrigger = context.finalRebalanceTrigger ?? context.effectiveRebalanceTrigger ?? 0;
+
+    console.log(
+      `[STRATEGY] ${sym.padEnd(8)} | Regime: ${regime.padEnd(18)} | ` +
+      `conviction: ${conviction.toFixed(3)} | ` +
+      `FiltVol: ${filteredVolatility ? filteredVolatility.toFixed(4) : 'N/A'} | ` +
+      `VolAdj: ${volAdjustment.toFixed(3)} | ` +
+      `H-Trig: ${finalHarvestTrigger.toFixed(4)} | ` +
+      `R-Trig: ${finalRebalanceTrigger.toFixed(4)}`
+    );
+  }
+
+  _getModulatedTriggers(sym, harvestMod = 0, rebalanceMod = 0, currentGenome = this.genome) {
+    if (!this.priceHistory[sym] || this.priceHistory[sym].length < 2) {
+      return null;
+    }
+
+    if (!this.volatilityFilters) {
+      this.volatilityFilters = {};
+    }
+    if (!this.filteredVolatility) {
+      this.filteredVolatility = {};
+    }
+
+    if (!this.volatilityFilters[sym]) {
+      this.volatilityFilters[sym] = new KalmanVolatilityFilter({
+        initialVolatility: 0.025,
+        processNoise: 0.00018,
+        measurementNoise: 0.007
+      });
+    }
+
+    const recentPrices = this.priceHistory[sym];
+    const rawVol = calculateRealizedVolatility(recentPrices);
+    const filteredVol = this.volatilityFilters[sym].update(rawVol);
+    this.filteredVolatility[sym] = filteredVol;
+
+    try {
+      const res = getAlphaModulatedTriggers({
+        flatHarvestTrigger: 0,
+        flatRebalanceTrigger: 0,
+        harvestModifier: harvestMod,
+        rebalanceModifier: rebalanceMod,
+        recentPrices
+      });
+      return {
+        ...res,
+        harvestModifier: harvestMod,
+        rebalanceModifier: rebalanceMod
+      };
+    } catch (_) {
+      return null;
+    }
   }
 }

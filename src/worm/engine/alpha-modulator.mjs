@@ -27,6 +27,12 @@ export function modulateRebalanceTrigger(baseTrigger, conviction) {
   return baseTrigger + mod;
 }
 
+export function modulateSpawnConviction(baseKelly, conviction) {
+  const scale = Math.max(0.7, Math.min(1.3, 1 + conviction * 0.25));
+  const raw = baseKelly * scale;
+  return Math.max(0.05, Math.min(0.95, raw));
+}
+
 export function getAlphaModulatedTriggers({
   flatHarvestTrigger,
   flatRebalanceTrigger,
@@ -56,5 +62,6 @@ export default {
   getAlphaConviction,
   modulateHarvestTrigger,
   modulateRebalanceTrigger,
+  modulateSpawnConviction,
   getAlphaModulatedTriggers
 };

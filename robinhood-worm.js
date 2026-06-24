@@ -528,9 +528,7 @@ async function mainLoop() {
 
     // --- Status Display ---
     // LEGION status display removed (no shadowLegion / assetHeatMap).
-    if (regimeDetector) {
-      // console.log(`🔮 [REGIME] ...`);
-    }
+
 
     // --- Use Engine State References for Convenience (Refactoring Step) ---
     // This allows us to keep the rest of the loop largely unchanged for this step
@@ -964,10 +962,15 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   process.on('SIGINT', gracefulShutdown);
   process.on('SIGTERM', gracefulShutdown);
 
-  mainLoop().catch((err) => {
-    console.error("❌ Fatal Error in Main Loop:", err);
-    rl.close();
-  });
+  mainLoop()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("❌ Fatal Error in Main Loop:", err);
+      rl.close();
+      process.exit(1);
+    });
 }
 
 export { TradingEngine, CoinbaseWormAPI, defaultGenome };
