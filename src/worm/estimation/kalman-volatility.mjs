@@ -1,5 +1,4 @@
 // src/worm/estimation/kalman-volatility.mjs
-// 1D Kalman Filter for estimating latent volatility from noisy realized volatility observations.
 
 export class KalmanVolatilityFilter {
   constructor(options = {}) {
