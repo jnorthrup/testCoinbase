@@ -7,7 +7,6 @@ import path from "path";
 import { fileURLToPath } from 'url';
 import { fork } from 'child_process';
 import { CoinbaseWormAPI } from './src/worm/api/coinbase-adapter.mjs';
-import { createWalletFacade } from './src/worm/api/wallet-facade.mjs';
 import { createClient, buildMinOrderQtyMap } from './coinbase-advanced.js';
 import {
   minIncrementMap,
@@ -26,14 +25,12 @@ dotenv.config();
 import { TradingEngine } from './src/worm/engine/trading-engine.mjs';
 import { AssetRegimeManager } from './src/worm/regime/asset-regime-manager.mjs';
 import { RegimeDetector } from './src/worm/regime/regime-detector.mjs';
-import { LegionManager } from './src/worm/legion/legion-manager.mjs';
 import { printTable } from './src/worm/utils/format.mjs';
 import { loadRecentMarketData, pruneMarketDataFile, appendMarketData } from './src/worm/utils/trade-logger.mjs';
 import { parsePreviewOrderArgs, parseStrategyPreviewArgs, parseStrategyPlaceArgs } from './src/worm/cli/args.mjs';
 import { runPreviewOrderOnce } from './src/worm/cli/run-preview.mjs';
 import { runStrategyPreviewOnce } from './src/worm/cli/run-strategy-preview.mjs';
 import { runStrategyPlaceOnce } from './src/worm/cli/run-strategy-place.mjs';
-import { ScientificOptimizer } from './src/worm/dreamer/scientific-optimizer.mjs';
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -55,30 +52,6 @@ async function initMinOrderQtyMap() {
 
 
 
-// ============== THE LEGION ARCHITECTURE CONFIG ==============
-const LEGION_CONFIG = {
-  // 🧠 THE BRAINS (Historical Math)
-  // CPU Bound. Auto-Scales to (Total Cores - 1) to leave room for the OS/Main Thread.
-  DREAMER_WORKER_COUNT: 1, // MANUAL OVERRIDE (Set to 2 to prevent lockup)
-
-  // ⚔️ THE SOLDIERS (Live Testing)
-  // Memory Bound.
-  // Eco Mode: Reduced to 50 for Mini PC.
-  TOTAL_SHADOW_CAPACITY: 50,
-
-  // 🎯 THE FOCUS
-  // How many shadows do we dedicate to an asset that is 'Active'?
-  // Eco Mode: Reduced to 10.
-  ACTIVE_ASSET_SWARM_DENSITY: 10,
-
-  // 🛠️ DEVELOPER TOOLS
-  ENABLE_DEVELOPER_LOGS: false, // Toggle this to see internal state data (Regime Radar, Rejection Reasons)
-
-  // 💤 THE RESERVES
-  // How many shadows keep watching boring assets just in case?
-  PASSIVE_ASSET_MONITOR_COUNT: 10
-};
-
 // ============== Config/Maps and Constants ==============
 
 // --- Asset Specific ---
@@ -99,9 +72,6 @@ let currentGenome = { ...defaultGenome };
 // --- Persistence ---
 const STATE_FILE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'liveEngineState.json');
 const BASELINE_LOAD_TOLERANCE_PERCENT = 0.50;
-
-// --- Evolution Configuration ---
-const SHADOW_COUNT = 10; // Number of shadow bots to run (Scalable)
 
 // --- COMPOUNDING CONFIG (The Alpha Tithe) ---
 const ENABLE_AUTO_COMPOUND = true;
@@ -148,10 +118,8 @@ if (Math.abs(defaultGenome.HARVEST_ALLOC_BTC_PERCENT + defaultGenome.HARVEST_ALL
 
 // ============== Global State ==============
 let liveEngine;
-let legionManager;       // The Allocator
 let assetRegimeManager;  // The Memory
 let regimeDetector;      // The Eyes (was Oracle)
-let dreamerGrid = [];    // The Deep Past Workers
 let harvestedAmount = 0;        // Tracks USD harvested within a single cycle
 // (getEffectivePriceFromResp, getFilledQuantityFromResp, getTotalFeesFromResp, getGrossValueFromResp, getSettledValueFromResp imported from helpers.mjs)
 
@@ -224,7 +192,6 @@ async function mainLoop() {
   await initMinOrderQtyMap();
 
   const dryRunOnce = process.argv.includes('--dry-run-once');
-  const paperMode = process.argv.includes('--paper');
   const previewOrder = parsePreviewOrderArgs(process.argv);
   const strategyPreview = parseStrategyPreviewArgs(process.argv);
   const strategyPlace = parseStrategyPlaceArgs(process.argv);
@@ -241,62 +208,31 @@ async function mainLoop() {
   let rh;
   try {
     const baseCoinbaseApi = new CoinbaseWormAPI({ readOnly, previewOnly: previewMode });
-    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : paperMode ? ' [PAPER-FACADE]' : readOnly ? ' [READ-ONLY-FACADE]' : '';
-    rh = createWalletFacade(baseCoinbaseApi, {
-      forceSimulated: paperMode,
-      modeLabel: paperMode ? 'paper' : readOnly ? 'read-only' : 'live',
-      startCapital: 10000,
-    });
+    const modeLabel = strategyPlace ? ' [STRATEGY-LIVE]' : strategyPreview ? ' [STRATEGY-PREVIEW]' : previewOrder ? ' [PREVIEW-ONLY]' : readOnly ? ' [READ-ONLY-FACADE]' : '';
+    rh = baseCoinbaseApi;
     console.log(`🔑 Coinbase API Initialized${modeLabel}.`);
   }
   catch (error) { console.error("❌ FATAL: API initialization failed:", error.message); rl.close(); return; }
 
   // --- Initialize Engine ---
-  // Engine is live-action shaped in every runtime. `--paper` explicitly selects
-  // the simulated wallet facade; live/read-only exceptions do not switch modes.
+  // Engine is live-action shaped in every runtime.
   const engineMode = 'live';
   liveEngine = new TradingEngine(defaultGenome, engineMode);
 
-  // Load State (for genome, promotion thresholds, etc. — applies to both modes)
+  // Load State (for genome, promotion thresholds, etc.)
   const { loadedBaselines, loadedTrailingState, loadedLastActionTimestamps, loadedGenome, loadedData, loadedAssetSourceTimeframe } = loadState();
   if (loadedData) {
     liveEngine.loadPersistedState(loadedData);
-    // User requested timeframe colors to start white and only colorize on new promotions this session.
-    // We no longer restore assetSourceTimeframe on boot.
     if (loadedData.overflowTarget) {
       SNOWBALL_CONFIG.OVERFLOW_TARGET = loadedData.overflowTarget;
       console.log(`🎯 [Worm Config] Restored dynamic overflow target: ${SNOWBALL_CONFIG.OVERFLOW_TARGET}`);
     }
   }
-  // Paper is a wallet-facade selection. Coinbase market-data reads remain live;
-  // portfolio/order state is simulated by the facade and may be seeded from
-  // persisted engine state when present.
-  if (paperMode && typeof rh.seedSimulationFromState === 'function') {
-    // Only use loaded cash if it's actually > 0 — otherwise fall back to seed capital
-    const loadedCash = loadedData?.cashBalance;
-    const hasValidCash = Number.isFinite(loadedCash) && loadedCash > 0;
-    rh.seedSimulationFromState({
-      cashBalance: hasValidCash ? loadedCash : undefined,
-      holdings: hasValidCash ? loadedData?.holdings : undefined,  // only adopt holdings if cash is valid
-      fallbackCash: 10000,
-    });
-    const simSnapshot = rh.snapshot?.();
-    if (simSnapshot) {
-      liveEngine.cashBalance = simSnapshot.cashBalance;
-      liveEngine.holdings = simSnapshot.holdings;
-      if (liveEngine.initialCapital <= 0 && simSnapshot.cashBalance > 0) liveEngine.initialCapital = simSnapshot.cashBalance;
-      if (liveEngine.peakTotalValue <= 0 && simSnapshot.cashBalance > 0) liveEngine.peakTotalValue = simSnapshot.cashBalance;
-      console.log(`📄 Wallet facade active: simulated orders/portfolio, live Coinbase market data. Cash $${simSnapshot.cashBalance.toFixed(2)}.`);
-    }
-  }
   if (loadedGenome) {
-    // Merge loaded genome with defaults, preserving overrides
     liveEngine.genome = { ...defaultGenome, ...loadedGenome };
-    // Preserve per-asset overrides if they exist
     if (loadedGenome.overrides) {
       liveEngine.genome.overrides = { ...loadedGenome.overrides };
     }
-    // console.log("✅ Loaded state from C:\\Users\\Parti\\webstorm\\cryptoBot\\liveEngineState.json.");
   }
 
   // Initialize promotion threshold from saved state — sanitize blowout scores on EVERY boot
@@ -403,213 +339,10 @@ async function mainLoop() {
   }
   console.log(`🔮 Regime Detector Online. Hydrated ${Object.keys(regimeDetector.regimes).length} regimes.`);
 
-  // 3. The Dreamer Grid (Deep Past)
-  const scriptPath = fileURLToPath(import.meta.url);
-  const dreamerGrid = [];
-  const totalWorkers = LEGION_CONFIG.DREAMER_WORKER_COUNT;
+  // Dreamer grid and Legion orchestration were removed in the paper/shadow/dreamer burn-down.
+  // Genome evolution is now static — live engine reads defaultGenome from disk and applies
+  // loaded overrides only; no external optimizer pipeline.
 
-  function spawnWorker(i) {
-    const worker = fork(scriptPath, ['--simulation', `--workerId=${i}`, `--totalWorkers=${totalWorkers}`], {
-      stdio: ['ignore', 'inherit', 'inherit', 'ipc']
-    });
-
-    worker.on('message', (msg) => {
-      if (msg.type === 'HEARTBEAT') {
-        // Optional: console.log(`   [Heartbeat] Batch ${msg.batch} | Best: ${msg.bestScore.toFixed(2)}`);
-      }
-      if (msg.type === 'OPTIMIZATION_FOUND') {
-        // 🏆 PROMOTION: Dreamer found a better genome
-        // WORKER sends candidate if it beats ITS local best.
-        // MAIN must verify it beats GLOBAL best (loaded from state).
-
-        // Recover Depth from Param String (e.g. "Champion [MEDIUM]")
-        let depthMode = "MEDIUM";
-        if (msg.param.includes("[SHORT]")) depthMode = "SHORT";
-        else if (msg.param.includes("[LONG]")) depthMode = "LONG";
-
-        const isShadowFeedback = msg.param === "FINE_TUNE_FEEDBACK";
-        const scoreKey = isShadowFeedback ? `${msg.focus}_SHADOW` : `${msg.focus}_${depthMode}`;
-        const assetThreshold = (global.lastBestScore && global.lastBestScore[scoreKey] !== undefined)
-          ? global.lastBestScore[scoreKey]
-          : -Infinity;
-
-        if (msg.score > assetThreshold) {
-          // If the incumbent is just re-establishing its baseline after a soft reset decay,
-          // update the threshold silently without spamming a promotion or resetting ratchets.
-          if (msg.val === 'INCUMBENT') {
-            global.lastBestScore[scoreKey] = msg.score;
-            saveEngineState(); // Persist baseline score
-            return;
-          }
-
-          // COLOR CODING: Visual indicator for Timeframe
-          let colorCode = "\x1b[32m"; // Default Green
-          if (depthMode === "SHORT") colorCode = "\x1b[36m"; // Cyan
-          else if (depthMode === "MEDIUM") colorCode = "\x1b[33m"; // Yellow
-          else if (depthMode === "LONG") colorCode = "\x1b[35m"; // Magenta
-
-          if (isShadowFeedback) {
-            console.log(`\n🏆 [PROMOTION] ${msg.focus}: ${colorCode}${msg.param}\x1b[0m = ${typeof msg.val === 'number' ? (Number.isInteger(msg.val) ? msg.val : msg.val.toFixed(2)) : msg.val} | Shadow Portfolio Value: $${msg.score?.toFixed(2)} (beat $${assetThreshold === -Infinity ? '0.00' : assetThreshold.toFixed(2)})`);
-          } else {
-            console.log(`\n🏆 [PROMOTION] ${msg.focus}: ${colorCode}${msg.param}\x1b[0m = ${typeof msg.val === 'number' ? (Number.isInteger(msg.val) ? msg.val : msg.val.toFixed(2)) : msg.val} | Alpha: ${msg.score?.toFixed(3)}% (beat ${assetThreshold.toFixed(3)}%)`);
-          }
-
-          // Apply to Live Engine
-          if (msg.focus && msg.genome && msg.genome.overrides && msg.genome.overrides[msg.focus]) {
-            if (!liveEngine.genome.overrides) liveEngine.genome.overrides = {};
-            if (!liveEngine.genome.overrides[msg.focus]) liveEngine.genome.overrides[msg.focus] = {};
-
-            // Merge Specific Asset overrides
-            // MUTATION LOCK: Prevent updates if asset is currently acting (Harvest/Rebalance)
-            const isRebalancing = liveEngine.rebalanceState && liveEngine.rebalanceState[msg.focus];
-            const isHarvesting = liveEngine.trailingState && liveEngine.trailingState[msg.focus] && liveEngine.trailingState[msg.focus].flagged;
-
-            if (isRebalancing || isHarvesting) {
-              console.log(`   🔒 [Mutation Lock] Skipped update for ${msg.focus} (Active State: ${isRebalancing ? 'Rebalancing' : 'Harvesting'}).`);
-            } else {
-              // Update per-asset best score ONLY when actually applied to prevent phantom promotions!
-              if (!global.lastBestScore) global.lastBestScore = {};
-              global.lastBestScore[scoreKey] = msg.score;
-
-              Object.assign(liveEngine.genome.overrides[msg.focus], msg.genome.overrides[msg.focus]);
-              console.log(`   ✅ Applied ${msg.param} optimization to ${msg.focus} live genome.`);
-
-              // HEARTBEAT RESET: Reset Micro-Ratchets on successful genome promotion
-              if (liveEngine.ratchetState && liveEngine.ratchetState[msg.focus]) {
-                liveEngine.ratchetState[msg.focus].harvestModifier = 0.0;
-                liveEngine.ratchetState[msg.focus].rebalanceModifier = 0.0;
-                liveEngine.ratchetState[msg.focus].lastTradeSide = null;
-                if (liveEngine.mode === 'LIVE') {
-                  console.log(`   🔄 [RATCHET RESET] Reset Micro-Ratchets for ${msg.focus} on genome promotion.`);
-                }
-              }
-
-              // Track Timeframe for Table Coloring
-              if (!liveEngine.assetSourceTimeframe) liveEngine.assetSourceTimeframe = {};
-              if (msg.param.includes("[SHORT]")) liveEngine.assetSourceTimeframe[msg.focus] = 'SHORT';
-              else if (msg.param.includes("[MEDIUM]")) liveEngine.assetSourceTimeframe[msg.focus] = 'MEDIUM';
-              else if (msg.param.includes("[LONG]")) liveEngine.assetSourceTimeframe[msg.focus] = 'LONG';
-
-              saveEngineState(); // Persist immediately
-            }
-          }
-        }
-      }
-
-      if (msg.type === 'RESET_SCORE') {
-        // The Dreamer has finished a full cycle for this asset.
-        // SOFT RESET: Decay the score (0.75x) instead of deleting it.
-        // This keeps the Main Process explicitly aware of the high bar.
-        if (global.lastBestScore && msg.asset) {
-          // Update: Iterate all timeframes to decay specific keys
-          const timeframes = ['SHORT', 'MEDIUM', 'LONG'];
-          timeframes.forEach(tf => {
-            const key = `${msg.asset}_${tf}`;
-            if (global.lastBestScore[key] !== undefined) {
-              if (msg.mode === 'SOFT') {
-                global.lastBestScore[key] = global.lastBestScore[key] > 0
-                  ? global.lastBestScore[key] * 0.75
-                  : global.lastBestScore[key] * 1.25;
-              } else {
-                delete global.lastBestScore[key]; // Hard reset
-              }
-            }
-          });
-          saveEngineState(); // Persist decayed scores immediately to disk
-        }
-      }
-
-      if (msg.type === 'TIER_1_UPDATE') {
-        // Initialize Aggregator
-        if (!global.dreamStats) global.dreamStats = { verified: [], rejected: {}, improvement: [], regimes: {} };
-
-        // Track Stats
-        if (msg.score === -100 || !msg.genome || Object.keys(msg.genome).length === 0) {
-          // Rejected / No Improvement
-          const r = msg.regime || 'UNK';
-          if (!global.dreamStats.rejected[r]) global.dreamStats.rejected[r] = 0;
-          global.dreamStats.rejected[r]++;
-        } else {
-          // Improvement Found!
-          global.dreamStats.improvement.push(msg.symbol);
-        }
-
-        // Track Regimes
-        const r = msg.regime || 'UNK';
-        if (!global.dreamStats.regimes[r]) global.dreamStats.regimes[r] = 0;
-        global.dreamStats.regimes[r]++;
-
-        // 1. Update Persistent Memory
-        assetRegimeManager.update(msg.symbol, msg.genome || {}, 'TIER_1_THEORETICAL', msg.regime || 'UNKNOWN').catch(e => console.error("❌ Failed to update asset regime:", e));
-        // 1b. Update Live Radar
-        if (regimeDetector) regimeDetector.regimes[msg.symbol] = msg.regime || 'UNKNOWN';
-
-        if (msg.genome && Object.keys(msg.genome).length > 0) {
-          // 2. Apply to Live Engine immediately (Hot Swap)
-          if (!liveEngine.genome.overrides) liveEngine.genome.overrides = {};
-          if (!liveEngine.genome.overrides[msg.symbol]) liveEngine.genome.overrides[msg.symbol] = {};
-
-          // Merge new genes
-          Object.assign(liveEngine.genome.overrides[msg.symbol], msg.genome);
-          // console.log(`   --> Applied experimental genes to Live Engine for ${msg.symbol}: ${JSON.stringify(msg.genome)}`);
-        }
-
-        if (legionManager) legionManager.notifyOptimizationComplete(msg.symbol); // Clear status
-
-        // Periodic flush of stats (Every 10 seconds or every 50 updates)
-        const NOW = Date.now();
-        if (!global.lastDreamStatFlush) global.lastDreamStatFlush = NOW;
-        if (NOW - global.lastDreamStatFlush > 10000) {
-          const totalRefusals = Object.values(global.dreamStats.rejected).reduce((a, b) => a + b, 0);
-          const totalSims = (msg.sims || 0); // Note: This is per worker, might be confusing if aggregated differently.
-          // Let's just track updates received.
-          const updates = totalRefusals + global.dreamStats.improvement.length;
-
-          if (updates > 0) {
-            // Build String
-            let out = `💤 [DREAMER] `;
-            if (global.dreamStats.improvement.length > 0) {
-              out += `✨ NEW: [${global.dreamStats.improvement.join(', ')}] | `;
-            }
-            out += `Rejected: ${totalRefusals} (`;
-            Object.entries(global.dreamStats.rejected).forEach(([reg, count]) => {
-              // Emoji Map
-              const em = reg === 'RALLY' ? '🚀' : reg === 'CRASH' ? '🩸' : reg === 'CHOP' ? '🦀' : '❓';
-              out += `${em}${count} `;
-            });
-            out += `) | Regimes: ${Object.keys(global.dreamStats.regimes).length} | Worker Sims: ~${totalSims}`;
-            console.log(out);
-
-            // Reset
-            global.dreamStats = { verified: [], rejected: {}, improvement: [], regimes: {} };
-            global.lastDreamStatFlush = NOW;
-          }
-        }
-      }
-    });
-
-    // Restart logic if worker dies
-    worker.on('exit', (code) => {
-      console.warn(`⚠️ Dreamer Worker ${worker.pid} (Worker ID ${i}) exited (code ${code}). Respawning in 5 seconds...`);
-      setTimeout(() => {
-        const idx = dreamerGrid.findIndex(w => w.pid === worker.pid);
-        const newWorker = spawnWorker(i);
-        if (idx !== -1) {
-          dreamerGrid[idx] = newWorker;
-        } else {
-          dreamerGrid.push(newWorker);
-        }
-      }, 5000);
-    });
-
-    return worker;
-  }
-
-  if (!dryRunOnce && !strategyPreview && !strategyPlace) {
-    for (let i = 0; i < totalWorkers; i++) {
-      dreamerGrid.push(spawnWorker(i));
-    }
-  }
   let lastStateSaveTime = 0; // Fix: Initialize variable to prevent ReferenceError
   let lastHistoryRefreshTime = Date.now(); // Track when we last refreshed history
   let lastOptimizationTime = Date.now(); // Track when we last triggered optimizations
@@ -654,19 +387,9 @@ async function mainLoop() {
   }
 
 
-  // 4. The Legion Manager (Broad Present)
-  // Orchestrates Shadows and dispatches orders to Dreamers
-  // In paper mode, we also run Legion for shadow bot evolution
-  const legionManager = (dryRunOnce || strategyPreview || strategyPlace) ? null : new LegionManager(liveEngine, TradingEngine, dreamerGrid);
-
-  // Inject dependencies into global scope/main loop variables helper if needed?
-  // We declared them as const here. They need to be accessible in the loop.
-  // Wait, the loop is inside THIS function space. So const is fine if defined before loop.
-  // BUT 'legionManager' is used in the loop.
-  // I should check if I broke any 'let' vs 'const' visibility.
-  // The previous code had 'let oracle' etc.
-  // 'const' is block scoped. This block is 'async function mainLoop'.
-  // The while loop is inside mainLoop. So 'const' is visible.
+  // 4. The Legion Manager (removed in paper/shadow/dreamer burn-down).
+  // The live engine reads defaultGenome + loaded overrides directly. No shadow dispatcher,
+  // no per-asset optimization queue.
 
   let previousCycleValues = {}; // Restoration of missing UI state
 
@@ -825,25 +548,12 @@ async function mainLoop() {
     }
 
     if (startTime - lastOptimizationTime >= HOURLY_REFRESH_INTERVAL) {
-      console.log("\n🚀 [HOURLY OPTIMIZATION] Triggering Mass Scientific Optimization for all assets...");
-      if (legionManager) {
-        // Request optimization for all active assets
-        const allAssets = Object.keys(liveEngine.baselines);
-        allAssets.forEach(asset => {
-          if (!HARVEST_EXCLUDE.includes(asset) && !REBALANCE_EXCLUDE.includes(asset)) {
-            legionManager.requestOptimization(asset);
-          }
-        });
-      }
+      // Hourly scientific optimization was Legion-driven; removed in burn-down.
       lastOptimizationTime = startTime;
     }
 
     // --- Status Display ---
-    if (legionManager) {
-      const hots = Object.values(legionManager.assetHeatMap).filter(v => v === 'HOT' || v === 'INFERNO').length;
-      const dreaming = Array.from(legionManager.activeDreamJobs).slice(0, 5).join(', ') + (legionManager.activeDreamJobs.size > 5 ? '...' : '');
-      console.log(`⚔️ [LEGION] Active Shadows: ${legionManager.shadowLegion.length} | Hot Assets: ${hots} | 🧠 Dreaming: [${dreaming}]`);
-    }
+    // LEGION status display removed (no shadowLegion / assetHeatMap).
     if (regimeDetector) {
       // console.log(`🔮 [REGIME] ...`);
     }
@@ -963,16 +673,8 @@ async function mainLoop() {
     });
 
     // --- STARTUP OPTIMIZATION TRIGGER ---
-    // Since we have history, we ask the Dreamers to optimize ALL active assets immediately on boot.
-    if (!global.hasTriggeredStartupOptimization && portfolioSummary.length > 0 && legionManager) {
-      console.log("\n🚀 [STARTUP] Triggering Mass Scientific Optimization for all assets...");
-      portfolioSummary.forEach(row => {
-        if (!HARVEST_EXCLUDE.includes(row.Symbol)) { // Respect Exclusions
-          legionManager.requestOptimization(row.Symbol);
-        }
-      });
-      global.hasTriggeredStartupOptimization = true;
-    }
+    // Startup optimization removed (Legion-driven). The live engine starts cold; the
+    // operator loads a tuned genome via disk before boot.
     // --- End EXCLUDED asset state cleanup ---
 
     let deletedKeys = false;
@@ -1223,11 +925,7 @@ async function mainLoop() {
         lastEngineHoldings = engineResult.holdings;
       }
 
-      // --- Legion Heartbeat ---
-      if (legionManager) {
-        // The Manager decides who lives anddies
-        await legionManager.heartbeat(portfolioSummary, rh);
-      }
+      // --- Legion Heartbeat --- removed in paper/shadow/dreamer burn-down.
 
       // --- Oracle/Regime Detector ---
       // Update Regime Detector with latest history
@@ -1257,15 +955,7 @@ async function mainLoop() {
       if (engineResult.stateChanged) stateChanged = true;
 
       // --- Post-Trade "Dream Replay" Trigger ---
-      // If we traded, immediately trigger a Re-Optimization to verify/fine-tune the decision based on new state.
-      if (anyTradesThisCycle && engineResult.tradedSymbols && engineResult.tradedSymbols.length > 0) {
-        if (legionManager) {
-          engineResult.tradedSymbols.forEach(sym => {
-            console.log(`⚡ [Dreamer] Trade detected on ${sym}. Triggering Immediate Verification Sweep...`);
-            legionManager.requestOptimization(sym);
-          });
-        }
-      }
+      // Post-trade Legion re-optimization removed in burn-down.
 
       // Refresh Local State References (Aliases) for Display Logic
       // This ensures we display the *post-update* state, especially if objects were reassigned.
@@ -1331,56 +1021,32 @@ async function mainLoop() {
 
   } // End Main Loop
 
-  console.log(strategyPlace ? "🛑 Strategy live run complete." : strategyPreview ? "🛑 Strategy preview complete." : dryRunOnce ? "🛑 Read-only dry run complete." : paperMode ? "🛑 Paper trading stopped." : "🛑 Main loop exited unexpectedly."); rl.close();
+  console.log(strategyPlace ? "🛑 Strategy live run complete." : strategyPreview ? "🛑 Strategy preview complete." : dryRunOnce ? "🛑 Read-only dry run complete." : "🛑 Main loop exited unexpectedly."); rl.close();
 } // End mainLoop Function
 
 // --- Entry Point ---
+// Pure live engine: no worker subprocess, no IPC, no shadow dispatch.
+// All Legion / dreamer / scientific-optimizer subsystems were removed.
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  if (process.argv.includes('--simulation')) {
-    console.log("🦾 Background Simulator Worker Starting...");
-    // Worker Logic Would Go Here... but for now we are just the Master.
-    // Wait, we defined the SimulatorWorker Class inside but we didn't hook it up to run!
-    // The user asked for "Self Contained". The SimulatorWorker class IS inside.
-    // We need to instantiate it if --simulation is present.
-    const worker = new ScientificOptimizer();
-    // Export helper for external testing if attached (dirty hack for test script)
-    if (global.TEST_MODE) global.testWorker = worker;
+  const gracefulShutdown = () => {
+    console.log("\n🛑 [Shutdown] Saving final engine state before exit...");
+    if (typeof globalSaveEngineState === 'function') {
+      globalSaveEngineState();
+    } else {
+      console.warn("⚠️ Warning: globalSaveEngineState is not initialized yet.");
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', gracefulShutdown);
+  process.on('SIGTERM', gracefulShutdown);
 
-    // --- IPC Listener for Shadow Feedback ---
-    process.on('message', (msg) => {
-      if (msg.type === 'FEEDBACK') {
-        worker.handleFeedback(msg);
-      } else if (msg.type === 'OPTIMIZE_ORDER') {
-        worker.prioritize(msg.symbol, msg.baseGenome);
-      }
-    });
-
-    worker.run().catch(err => {
-      console.error("💥 Simulator Worker Crashed:", err);
-      process.exit(1);
-    });
-  } else {
-    // Master Process
-    const gracefulShutdown = () => {
-      console.log("\n🛑 [Shutdown] Saving final engine state before exit...");
-      if (typeof globalSaveEngineState === 'function') {
-        globalSaveEngineState();
-      } else {
-        console.warn("⚠️ Warning: globalSaveEngineState is not initialized yet.");
-      }
-      process.exit(0);
-    };
-    process.on('SIGINT', gracefulShutdown);
-    process.on('SIGTERM', gracefulShutdown);
-
-    mainLoop().catch((err) => {
-      console.error("❌ Fatal Error in Main Loop:", err);
-      rl.close();
-    });
-  }
+  mainLoop().catch((err) => {
+    console.error("❌ Fatal Error in Main Loop:", err);
+    rl.close();
+  });
 }
-export { TradingEngine, CoinbaseWormAPI, defaultGenome, ScientificOptimizer };
-// ==================== Change Log ====================
+
+export { TradingEngine, CoinbaseWormAPI, defaultGenome };
 // v4.0.0: "Hyper-Evolutionary" (Current Version)
 // - **MAJOR ARCHITECTURE CHANGE**: Migrated 11 hard-coded constants into evolving genome
 // - Added Physics Genes: SPAR_DRAG_COEFFICIENT (0.80-0.999999), PRICE_HISTORY_WINDOW_SIZE (20-2000), ADAPTIVE_VOLATILITY_THRESHOLD (0.001-0.10)
