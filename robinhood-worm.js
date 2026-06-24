@@ -23,8 +23,6 @@ dotenv.config();
 
 // ─── Lifted submodules ───────────────────────────────────────────────────────
 import { TradingEngine } from './src/worm/engine/trading-engine.mjs';
-import { AssetRegimeManager } from './src/worm/regime/asset-regime-manager.mjs';
-import { RegimeDetector } from './src/worm/regime/regime-detector.mjs';
 import { printTable } from './src/worm/utils/format.mjs';
 import { loadRecentMarketData, pruneMarketDataFile, appendMarketData } from './src/worm/utils/trade-logger.mjs';
 import { parsePreviewOrderArgs, parseStrategyPreviewArgs, parseStrategyPlaceArgs } from './src/worm/cli/args.mjs';
@@ -118,8 +116,6 @@ if (Math.abs(defaultGenome.HARVEST_ALLOC_BTC_PERCENT + defaultGenome.HARVEST_ALL
 
 // ============== Global State ==============
 let liveEngine;
-let assetRegimeManager;  // The Memory
-let regimeDetector;      // The Eyes (was Oracle)
 let harvestedAmount = 0;        // Tracks USD harvested within a single cycle
 // (getEffectivePriceFromResp, getFilledQuantityFromResp, getTotalFeesFromResp, getGrossValueFromResp, getSettledValueFromResp imported from helpers.mjs)
 
@@ -153,9 +149,6 @@ function saveState() {
   try {
     if (!liveEngine) return;
     const stateToSave = liveEngine.getStateSnapshot(); // Save from Engine
-    if (typeof regimeDetector !== 'undefined') {
-      stateToSave.regimeDetectorState = regimeDetector.regimes;
-    }
     const tempFilePath = STATE_FILE_PATH + '.tmp';
     fs.writeFileSync(tempFilePath, JSON.stringify(stateToSave, null, 2));
 
@@ -319,25 +312,6 @@ async function mainLoop() {
 
   let initialized = false;
   let lastEngineHoldings = {}; // Track engine's holdings from previous cycle for display
-
-  // --- Initialize Managers (Legion Architecture) ---
-  // 1. Asset & Regime Memory (Tier 1 & 2 Configs)
-  // Stores the "Genetic Memory" of the system across reboots
-  const assetRegimeManager = new AssetRegimeManager();
-  console.log(`🧠 Asset Regime Manager Loaded (${Object.keys(assetRegimeManager.memory || {}).length} asset records).`);
-
-  // 2. Regime Detector (The New Oracle)
-  const regimeDetector = new RegimeDetector();
-  // Hydrate Detector from Memory
-  if (assetRegimeManager && assetRegimeManager.memory) {
-    Object.keys(assetRegimeManager.memory).forEach(sym => {
-      const profile = assetRegimeManager.memory[sym];
-      if (profile && profile.activeRegime) {
-        regimeDetector.regimes[sym] = profile.activeRegime;
-      }
-    });
-  }
-  console.log(`🔮 Regime Detector Online. Hydrated ${Object.keys(regimeDetector.regimes).length} regimes.`);
 
   // Dreamer grid and Legion orchestration were removed in the paper/shadow/dreamer burn-down.
   // Genome evolution is now static — live engine reads defaultGenome from disk and applies
@@ -865,36 +839,9 @@ async function mainLoop() {
         const resetColor = '\x1b[0m';
         console.log(`Deviation (Managed):    ${diffColor}${diffPrefix}$${totalBaselineDifference.toFixed(2)} (${currentPortfolioDeviationPercent.toFixed(2)}%)${resetColor}`);
 
-    // --- Fetch 24h Gainers/Losers for Regime Study ---
-    if (regimeDetector && rh && !strategyPreview && !strategyPlace) {
-      try {
-        const movers = await rh.getGainersLosers(10);
-        if (movers.gainers.length > 0 || movers.losers.length > 0) {
-          regimeDetector.updateMarket24h(movers.gainers, movers.losers);
-        }
-      } catch (err) {
-        console.warn(`⚠️ Failed to fetch 24h gainers/losers: ${err.message}`);
-      }
-    }
-
-    // --- Regime Radar (Legion Awareness) ---
-    if (LEGION_CONFIG.ENABLE_DEVELOPER_LOGS && regimeDetector && regimeDetector.regimes) {
-      const activeRegimes = Object.entries(regimeDetector.regimes)
-        .filter(([s, r]) => tokenBaselines[s])
-        .map(([s, r]) => `${s}:${r}`)
-        .join(" | ");
-      if (activeRegimes.length > 0) console.log(`🛠️ [DEV] Regime Radar: [${activeRegimes}]`);
-    }
     console.log("--------------------------\n");
 
 
-    // Update Regime Detector History
-    if (portfolioSummary.length > 0 && regimeDetector) {
-      // We feed the detector. It maintains its own buffer.
-      portfolioSummary.forEach(row => {
-        regimeDetector.update(row.Symbol, row.Price, row.t || Date.now());
-      });
-    }
 
     if (strategyPreview) {
       await runStrategyPreviewOnce(liveEngine, rh, strategyPreview, portfolioSummary, holdingDetails, cashBalance);
@@ -927,29 +874,6 @@ async function mainLoop() {
 
       // --- Legion Heartbeat --- removed in paper/shadow/dreamer burn-down.
 
-      // --- Oracle/Regime Detector ---
-      // Update Regime Detector with latest history
-      if (portfolioSummary.length > 0) {
-        const historyTick = { timestamp: Date.now(), p: {} };
-        portfolioSummary.forEach(row => historyTick.p[row.Symbol] = row.Price);
-        // We need to maintain a history buffer for the detector per asset?
-        // RegimeDetector expects an array of prices for a single asset.
-        // We should collect this data cleanly.
-        // For now, let's assume RegimeDetector helps us or we just feed it?
-        // Actually, RegimeDetector.analyze takes (symbol, historyArray).
-        // We need to pass the history.
-        // Let's use the liveEngine's price history for this?
-        // liveEngine.priceHistory contains raw objects.
-
-        // Iterate all assets and update regime
-        portfolioSummary.forEach(row => {
-          const sym = row.Symbol;
-          // Extract simplified price history from engine
-          // This is expensive every tick? Maybe do it occasionally.
-          // The Manager does it inside heartbeat if needed, but the Detector is separate.
-          // Let's rely on Manager to query Detector if needed, or update Detector here.
-        });
-      }
 
       anyTradesThisCycle = engineResult.anyTradesThisCycle;
       if (engineResult.stateChanged) stateChanged = true;

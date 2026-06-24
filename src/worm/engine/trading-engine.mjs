@@ -27,6 +27,8 @@ import {
 import { MultiAssetKalman, kalmanSlipCap } from '../estimation/kalman.mjs';
 import { createRegimeDetector } from '../estimation/markov-regime.mjs';
 import { RiskPolicy } from './risk-invariants.mjs';
+import { induceOptimalTrigger, induceOptimalAllocation } from '../estimation/inductive-oracle.mjs';
+import { calculateDownsideSemiVariance } from '../estimation/quant-discriminators.mjs';
 const MIN_ORDER_QTY_MAP = new Proxy({}, {
   get(_, k)  { return getMinOrderQtyMap()[k]; },
   ownKeys()  { return Object.keys(getMinOrderQtyMap()); },
@@ -176,6 +178,20 @@ function _bookSlipFromApi(api, sym, side, orderSizeUsd) {
     if (!book || !book.bids || !book.asks) return null;
     const slip = metricSlippageFromBook(book, side, orderSizeUsd || 100);
     return Number.isFinite(slip) && slip !== null ? slip : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Helper to grab the order book synchronously from the cache if available.
+ */
+function _getBookFromApi(api, sym) {
+  try {
+    const getter = api && (api._bookCache?.getBook || api.getProductBook);
+    if (typeof getter !== 'function') return null;
+    const bookOrPromise = getter.call(api._bookCache || api, `${sym}-USD`, 10);
+    return (bookOrPromise && typeof bookOrPromise.then === 'function') ? null : bookOrPromise;
   } catch (_) {
     return null;
   }
@@ -996,8 +1012,6 @@ export class TradingEngine {
         // Fetch dynamic params
         const effectiveGenome = this._getEffectiveGenome(sym, currentGenome);
         const hMod = rSt.harvestModifier || 0.0;
-        const modulated = this._getModulatedTriggers(sym, hMod, rSt.rebalanceModifier || 0.0, effectiveGenome);
-
         const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
         const oracleFloorSell = _oracleSlipFloor(api, sym, 'sell');
         const oracleFloorBuy  = _oracleSlipFloor(api, sym, 'buy');
@@ -1008,9 +1022,14 @@ export class TradingEngine {
         const lastSlippage = (rSt.lastSlippage !== undefined && rSt.lastSlippage !== null) ? rSt.lastSlippage : slipConfig.sell;
         const apiSellSlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].sell : null;
         const effectiveSellSlip = (apiSellSlip !== null) ? Math.max(apiSellSlip, lastSlippage) : lastSlippage;
-        const effectiveHarvestTrigger = (modulated?.modulatedHarvestTrigger
-          ?? (getGenomicParam(effectiveGenome, 'FLAT_HARVEST_TRIGGER_PERCENT', sym) + hMod)) + effectiveSellSlip;
-        this._logStrategyState(sym, { ...modulated, effectiveHarvestTrigger });
+        
+        // Oracle Induction
+        const expectedTxCost = effectiveSellSlip + 0.004; // 40 bps assumed exchange fee
+        const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
+        const optimalHarvestTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
+        const effectiveHarvestTrigger = optimalHarvestTrigger + hMod;
+
+        this._logStrategyState(sym, { effectiveHarvestTrigger });
         const harvestTriggerValue = currentBaseline * (1 + effectiveHarvestTrigger);
 
         if (!trailingState[sym]) { trailingState[sym] = { flagged: false, harvestCycleCount: 0, flaggedAt: null, previousDeviation: null }; }
@@ -1180,12 +1199,26 @@ export class TradingEngine {
           // Applies to ALL harvested proceeds once the crash fund is satisfied.
           // All tokens — regardless of size — get the same split treatment.
           if (harvestedAmount >= (currentGenome.MIN_HARVEST_TO_ALLOCATE || 0.25)) {
-            const amountForBTC = harvestedAmount * (currentGenome.HARVEST_ALLOC_BTC_PERCENT ?? 0.25);
-            const amountForETH = harvestedAmount * (currentGenome.HARVEST_ALLOC_ETH_PERCENT ?? 0.25);
-            const amountForReinvest = harvestedAmount * (currentGenome.HARVEST_ALLOC_REINVEST_PERCENT ?? 0.25);
+            // Oracle Induction
+            const btcP = portfolioSummary.find(r => r.Symbol === 'BTC')?.Price || api?.lastPrices?.['BTC'] || 0;
+            const ethP = portfolioSummary.find(r => r.Symbol === 'ETH')?.Price || api?.lastPrices?.['ETH'] || 0;
+
+            const context = {
+               assets: {
+                 'BTC': { book: _getBookFromApi(api, 'BTC'), kalmanEstimate: _kalman.getEstimate('BTC'), currentPrice: btcP, prices: this.priceHistory['BTC'] || [] },
+                 'ETH': { book: _getBookFromApi(api, 'ETH'), kalmanEstimate: _kalman.getEstimate('ETH'), currentPrice: ethP, prices: this.priceHistory['ETH'] || [] },
+                 [sym]: { book: _getBookFromApi(api, sym), kalmanEstimate: _kalman.getEstimate(sym), currentPrice: curP, prices: this.priceHistory[sym] || [] }
+               },
+               triggerAsset: sym
+            };
+            const allocs = induceOptimalAllocation(context);
+
+            const amountForBTC = harvestedAmount * allocs.BTC;
+            const amountForETH = harvestedAmount * allocs.ETH;
+            const amountForReinvest = harvestedAmount * allocs.Reinvest;
 
             if (this.mode === 'LIVE') {
-              console.log(`🌾 Harvest Allocation ($${harvestedAmount.toFixed(2)} total): Safety BTC $${amountForBTC.toFixed(2)} | Safety ETH $${amountForETH.toFixed(2)} | Reinvest $${amountForReinvest.toFixed(2)} | Cash $${(harvestedAmount * (1 - (currentGenome.HARVEST_ALLOC_BTC_PERCENT ?? 0.25) - (currentGenome.HARVEST_ALLOC_ETH_PERCENT ?? 0.25) - (currentGenome.HARVEST_ALLOC_REINVEST_PERCENT ?? 0.25))).toFixed(2)}`);
+              console.log(`🌾 Kelly Harvest Allocation ($${harvestedAmount.toFixed(2)} total): Safety BTC $${amountForBTC.toFixed(2)} (${(allocs.BTC*100).toFixed(1)}%) | Safety ETH $${amountForETH.toFixed(2)} (${(allocs.ETH*100).toFixed(1)}%) | Reinvest $${amountForReinvest.toFixed(2)} (${(allocs.Reinvest*100).toFixed(1)}%) | Cash $${(harvestedAmount * allocs.Cash).toFixed(2)} (${(allocs.Cash*100).toFixed(1)}%)`);
             }
 
             // 1. BTC Buy Execution
@@ -1347,18 +1380,6 @@ export class TradingEngine {
 
         const effectiveGenome = this._getEffectiveGenome(sym, currentGenome);
         const rMod = ratSt.rebalanceModifier || 0.0;
-        const modulated = this._getModulatedTriggers(sym, ratSt.harvestModifier || 0.0, rMod, effectiveGenome);
-        let effectiveRebalanceTrigger = modulated?.modulatedRebalanceTrigger
-          ?? (getGenomicParam(effectiveGenome, 'FLAT_REBALANCE_TRIGGER_PERCENT', sym) + rMod);
-        if (isGlobalRiskSignalActive) {
-          effectiveRebalanceTrigger *= (effectiveGenome.CRASH_PROTECTION_THRESHOLD_INCREASE || 2);
-          if (this.mode === 'LIVE' && !global.hasLoggedCPTrigger) {
-            console.log(`🛡️ [Crash Protection ACTIVE] Widening rebalance triggers for API safety.`);
-            global.hasLoggedCPTrigger = true;
-          }
-        } else {
-          global.hasLoggedCPTrigger = false;
-        }
 
         const _defaultSlip = SLIPPAGE_BUFFERS[sym] || SLIPPAGE_BUFFERS.DEFAULT;
         const oracleFloorSell = _oracleSlipFloor(api, sym, 'sell');
@@ -1370,8 +1391,24 @@ export class TradingEngine {
         const lastSlippage = (ratSt.lastSlippage !== undefined && ratSt.lastSlippage !== null) ? ratSt.lastSlippage : slipConfig.buy;
         const apiBuySlip = (api && api.lastSpreads && api.lastSpreads[sym]) ? api.lastSpreads[sym].buy : null;
         const effectiveBuySlip = (apiBuySlip !== null) ? Math.max(apiBuySlip, lastSlippage) : lastSlippage;
-        effectiveRebalanceTrigger += effectiveBuySlip;
-        this._logStrategyState(sym, { ...modulated, effectiveRebalanceTrigger });
+        
+        // Oracle Induction
+        const expectedTxCost = effectiveBuySlip + 0.004;
+        const dSemiVar = calculateDownsideSemiVariance(this.priceHistory[sym] || []);
+        let optimalRebalanceTrigger = induceOptimalTrigger(dSemiVar, expectedTxCost);
+        let effectiveRebalanceTrigger = optimalRebalanceTrigger + rMod;
+
+        if (isGlobalRiskSignalActive) {
+          effectiveRebalanceTrigger *= (effectiveGenome.CRASH_PROTECTION_THRESHOLD_INCREASE || 2);
+          if (this.mode === 'LIVE' && !global.hasLoggedCPTrigger) {
+            console.log(`🛡️ [Crash Protection ACTIVE] Widening rebalance triggers for API safety.`);
+            global.hasLoggedCPTrigger = true;
+          }
+        } else {
+          global.hasLoggedCPTrigger = false;
+        }
+
+        this._logStrategyState(sym, { effectiveRebalanceTrigger });
 
         const rebalanceTriggerValue = currentBaseline * (1 - effectiveRebalanceTrigger);
 
